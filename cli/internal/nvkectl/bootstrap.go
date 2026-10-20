@@ -29,6 +29,7 @@ import (
 	bootstrapengine "github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/engine"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/etcdkey"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nvkrrelease"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/pivot"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitecluster"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitespec"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/spireentrydump"
@@ -177,6 +178,10 @@ Postgres, Temporal, SPIRE, Cluster API with CAPNICo, and the NVKE controller,
 with SPIRE published at the control-plane VIP. A site without a default
 StorageClass gets local-path-provisioner. The site's nodes pull the controller
 image, so --nvke-controller-image must name a registry they can reach.
+It then moves the management plane onto the site: the nodes' SPIRE identity,
+the Cluster API objects, the controller's database and the Secrets the
+controller needs. The bootstrap cluster is kept afterwards, with its controller
+and SPIRE server stopped.
 
 See the bundled examples/sitespec.yaml and docs/sitespec.md for the
 site spec file format.`,
@@ -463,7 +468,8 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 
 		if opts.keepBootstrapKind || seedHoldsState || (siteClusterCreated && err != nil) {
 			if seedHoldsState {
-				logger.Info("leaving the bootstrap kind cluster running: it holds the site's management state",
+				logger.Info("leaving the bootstrap kind cluster running: it holds the site's management state; "+
+					"delete it once the site is confirmed healthy",
 					"cluster", cluster.Name, "kubeconfig", cluster.KubeconfigPath)
 			} else if siteClusterCreated && err != nil {
 				logger.Warn("bootstrap failed after site cluster creation; retaining the bootstrap kind cluster for recovery",
@@ -535,6 +541,9 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 		if err := deploySiteStack(ctx, inv, kubeconfigPath, cweCfg, opts.cweRunner, logger); err != nil {
 			return err
 		}
+		if err := pivotToSite(ctx, inv, cluster.KubeconfigPath, kubeconfigPath, cweCfg, logger); err != nil {
+			return err
+		}
 	}
 
 	// Nico mode does not list the allocated nodes here; kubectl get nodes shows them.
@@ -600,6 +609,36 @@ func siteDeployConfig(inv *sitespec.SiteSpec, seed controllerdeploy.Config) cont
 	cfg.SPIFFEClusterName = inv.ClusterName
 	cfg.SPIREExternalAddress = inv.Cluster.ControlPlaneVIP
 	return cfg
+}
+
+// pivotToSite moves the management plane of the cluster from the bootstrap
+// cluster onto the site cluster, which already runs the NVKE stack.
+func pivotToSite(
+	ctx context.Context,
+	inv *sitespec.SiteSpec,
+	seedKubeconfig, siteKubeconfig string,
+	cweCfg controllerdeploy.Config,
+	logger *slog.Logger,
+) error {
+	cweURL := fmt.Sprintf("http://127.0.0.1:%d", cweCfg.CWEPort)
+	client, err := clients.New(config.SiteConfig{URL: cweURL})
+	if err != nil {
+		return fmt.Errorf("building the controller client for %s: %w", cweURL, err)
+	}
+	created, err := client.FindClusterByName(ctx, inv.ClusterName)
+	if err != nil {
+		return fmt.Errorf("finding cluster %q on the bootstrap controller: %w", inv.ClusterName, err)
+	}
+	logger.Info("moving the management plane onto the site cluster", "kubeconfig", siteKubeconfig)
+	return pivot.Run(ctx, pivot.Config{
+		SeedKubeconfig:   seedKubeconfig,
+		SiteKubeconfig:   siteKubeconfig,
+		Controller:       client,
+		ClusterID:        created.ID,
+		ClusterName:      inv.ClusterName,
+		SiteSpireAddress: inv.Cluster.ControlPlaneVIP,
+		Logger:           logger,
+	})
 }
 
 // untaintTimeout bounds the whole untaint: one List and a few Updates.

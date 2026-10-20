@@ -48,6 +48,10 @@ Postgres, Temporal, SPIRE, Cluster API with CAPNICo, and the NVKE controller,
 with SPIRE published at the control-plane VIP. A site without a default
 StorageClass gets local-path-provisioner. The site's nodes pull the controller
 image, so --nvke-controller-image must name a registry they can reach.
+It then moves the management plane onto the site: the nodes' SPIRE identity,
+the Cluster API objects, the controller's database and the Secrets the
+controller needs. The bootstrap cluster is kept afterwards, with its controller
+and SPIRE server stopped.
 
 See the bundled examples/sitespec.yaml and docs/sitespec.md for the
 site spec file format.
