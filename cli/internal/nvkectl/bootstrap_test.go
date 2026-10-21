@@ -680,6 +680,23 @@ func TestCWEDeployConfigUsesSiteSpecTrustDomain(t *testing.T) {
 	}
 }
 
+func TestSiteDeployConfigNamesTheSite(t *testing.T) {
+	seed := controllerdeploy.Config{
+		CWEImage: "registry.example.com/nvke-controller:1", SPIFFEClusterName: "nvkectl-bootstrap",
+		SPIFFETrustDomain: "site.example.com", SPIREExternalAddress: "192.0.2.1",
+	}
+	inv := &sitespec.SiteSpec{ClusterName: "site", Cluster: sitespec.Cluster{ControlPlaneVIP: "192.0.2.100"}}
+	cfg := siteDeployConfig(inv, seed)
+	if cfg.SPIFFEClusterName != "site" || cfg.SPIREExternalAddress != "192.0.2.100" {
+		t.Errorf("SPIFFEClusterName, SPIREExternalAddress = %q, %q; want the site's name and VIP",
+			cfg.SPIFFEClusterName, cfg.SPIREExternalAddress)
+	}
+	if cfg.SPIFFETrustDomain != seed.SPIFFETrustDomain || cfg.CWEImage != seed.CWEImage {
+		t.Errorf("the site must keep the bootstrap cluster's trust domain and image, got %q and %q",
+			cfg.SPIFFETrustDomain, cfg.CWEImage)
+	}
+}
+
 func TestCWEDeployConfigDefaultsTrustDomain(t *testing.T) {
 	setBootstrapEnv(t)
 	t.Setenv("NVKECTL_SPIFFE_TRUST_DOMAIN", "")
@@ -2482,5 +2499,55 @@ func TestBootstrapPortMappings_ControllerAPIIsLoopbackOnly(t *testing.T) {
 	cfg.DisableMTLS = true
 	if got := bootstrapPortMappings(cfg); len(got) != 1 {
 		t.Errorf("mappings without the TPM attestor = %+v, want only the controller API", got)
+	}
+}
+
+// flakySiteRunner fails the first controller install, as a dropped connection
+// to the site's VIP does, and records the Postgres password each install passed.
+type flakySiteRunner struct {
+	controllerInstalls int
+	passwords          []string
+}
+
+func (r *flakySiteRunner) Run(_ context.Context, name string, args ...string) (string, error) {
+	line := name + " " + strings.Join(args, " ")
+	switch {
+	case strings.Contains(line, "get storageclass"):
+		return "true\n", nil
+	case strings.Contains(line, "get --raw"):
+		return `{"status":"ok"}`, nil
+	case strings.Contains(line, "upgrade --install postgres"):
+		for i, arg := range args {
+			if arg == "--values" && i+1 < len(args) {
+				if b, err := os.ReadFile(args[i+1]); err == nil && strings.Contains(string(b), "password") {
+					r.passwords = append(r.passwords, string(b))
+				}
+			}
+		}
+	case strings.Contains(line, "upgrade --install nke-controller"):
+		r.controllerInstalls++
+		if r.controllerInstalls == 1 {
+			return "write: broken pipe", errors.New("exit status 1")
+		}
+	}
+	return "", nil
+}
+
+func TestDeploySiteStackRetriesWithTheSamePassword(t *testing.T) {
+	runner := &flakySiteRunner{}
+	cfg := controllerdeploy.Config{
+		CWEImage: "registry.example.com/nvke-controller:1", ProvisionedProviderImage: "registry.example.com/provisioned:1",
+		DisableMTLS: true, ReadyTimeout: time.Second,
+	}
+	inv := &sitespec.SiteSpec{ClusterName: "site", Cluster: sitespec.Cluster{ControlPlaneVIP: "192.0.2.100"}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := deploySiteStack(context.Background(), inv, "site.kubeconfig", cfg, runner, logger); err != nil {
+		t.Fatalf("deploySiteStack: %v", err)
+	}
+	if runner.controllerInstalls != 2 {
+		t.Fatalf("controller installs = %d, want a retry after the failed one", runner.controllerInstalls)
+	}
+	if len(runner.passwords) != 2 || runner.passwords[0] != runner.passwords[1] {
+		t.Fatalf("each attempt must pass Postgres the same password, got %d differing values", len(runner.passwords))
 	}
 }

@@ -5,6 +5,7 @@ package nvkectl
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -170,6 +171,12 @@ comes from NVKECTL_NODE_USER and NVKECTL_NODE_PASSWORD; and
 spire.externalAddress is required unless --disable-mtls is set. The nodes'
 names and addresses are not printed; read them with "kubectl get nodes -o wide"
 on the finished cluster.
+
+With nico, the NVKE stack is then installed on the site cluster the same way:
+Postgres, Temporal, SPIRE, Cluster API with CAPNICo, and the NVKE controller,
+with SPIRE published at the control-plane VIP. A site without a default
+StorageClass gets local-path-provisioner. The site's nodes pull the controller
+image, so --nvke-controller-image must name a registry they can reach.
 
 See the bundled examples/sitespec.yaml and docs/sitespec.md for the
 site spec file format.`,
@@ -407,6 +414,12 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	if err := requireLocalImages(ctx, engine, nvkeImages(cweCfg)...); err != nil {
 		return err
 	}
+	// The site cluster's nodes pull the controller image themselves.
+	if installsSiteStack(inv, cweCfg) && !hasRegistryHost(cweCfg.CWEImage) {
+		return fmt.Errorf("with infra.provider nico the NVKE stack is installed on the site cluster, whose nodes pull "+
+			"the controller image themselves; %s names no registry. Pass an image the nodes can pull with "+
+			"--nvke-controller-image or NVKECTL_NVKE_CONTROLLER_IMAGE", cweCfg.CWEImage)
+	}
 
 	logger.Info("creating ephemeral bootstrap kind cluster", "cluster", cfg.ClusterName)
 	cluster, err := engine.Create(ctx, cfg)
@@ -419,6 +432,9 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	// without -v the bootstrap cluster's diagnostics are not collected and it
 	// is torn down.
 	handedOver := false
+	// seedHoldsState is set once the NVKE stack goes onto the site cluster:
+	// the bootstrap cluster still manages the site, so it is never deleted.
+	seedHoldsState := false
 	defer func() {
 		// Collect diagnostics before anything is torn down: this cluster is
 		// removed on every exit path, so this is the only moment the evidence
@@ -445,8 +461,11 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 			cancelDiagnostics()
 		}
 
-		if opts.keepBootstrapKind || (siteClusterCreated && err != nil) {
-			if siteClusterCreated && err != nil {
+		if opts.keepBootstrapKind || seedHoldsState || (siteClusterCreated && err != nil) {
+			if seedHoldsState {
+				logger.Info("leaving the bootstrap kind cluster running: it holds the site's management state",
+					"cluster", cluster.Name, "kubeconfig", cluster.KubeconfigPath)
+			} else if siteClusterCreated && err != nil {
 				logger.Warn("bootstrap failed after site cluster creation; retaining the bootstrap kind cluster for recovery",
 					"cluster", cluster.Name, "kubeconfig", cluster.KubeconfigPath)
 			} else {
@@ -511,11 +530,76 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	if err := makeControlPlaneSchedulable(ctx, inv, kubeconfigPath, opts, logger); err != nil {
 		return err
 	}
+	if installsSiteStack(inv, cweCfg) {
+		seedHoldsState = true
+		if err := deploySiteStack(ctx, inv, kubeconfigPath, cweCfg, opts.cweRunner, logger); err != nil {
+			return err
+		}
+	}
 
 	// Nico mode does not list the allocated nodes here; kubectl get nodes shows them.
 	fmt.Fprintf(out, "\nCluster %q is ready. Talk to it with:\n  kubectl --kubeconfig %s get nodes\n",
 		inv.ClusterName, kubeconfigPath)
 	return nil
+}
+
+// siteDeployAttempts bounds how often deploySiteStack runs the install.
+const siteDeployAttempts = 3
+
+// installsSiteStack reports whether the bootstrap installs the NVKE stack on
+// the site cluster: with nico, so the site can take over its own management.
+func installsSiteStack(inv *sitespec.SiteSpec, cweCfg controllerdeploy.Config) bool {
+	return inv.IsNico() && !cweCfg.DisableMTLS
+}
+
+// deploySiteStack installs the NVKE stack on the site cluster as the bootstrap
+// cluster runs it, and waits for the site's controller to report healthy.
+func deploySiteStack(
+	ctx context.Context,
+	inv *sitespec.SiteSpec,
+	siteKubeconfig string,
+	cweCfg controllerdeploy.Config,
+	runner controllerdeploy.CommandRunner,
+	logger *slog.Logger,
+) error {
+	cfg := siteDeployConfig(inv, cweCfg)
+	cwe := controllerdeploy.New(runner, logger)
+	logger.Info("installing the NVKE stack on the site cluster", "kubeconfig", siteKubeconfig, "image", cfg.CWEImage)
+	if err := cwe.EnsureDefaultStorageClass(ctx, siteKubeconfig); err != nil {
+		return fmt.Errorf("site cluster: %w", err)
+	}
+	// A retry must reuse the database password the first attempt installed.
+	if cfg.PostgresPassword == "" {
+		cfg.PostgresPassword = rand.Text()
+	}
+	// The site API is reached through a VIP that has only just come up, and one
+	// dropped connection fails a helm call. Every step is an idempotent
+	// upgrade --install or apply, so the install is repeated.
+	var err error
+	for attempt := 1; attempt <= siteDeployAttempts; attempt++ {
+		if err = cwe.Deploy(ctx, siteKubeconfig, cfg); err == nil {
+			break
+		}
+		logger.Warn("installing the NVKE stack on the site cluster failed", "attempt", attempt, "of", siteDeployAttempts, "err", err)
+	}
+	if err != nil {
+		return fmt.Errorf("installing the NVKE stack on the site cluster: %w", err)
+	}
+	if err := cwe.WaitReady(ctx, siteKubeconfig, cfg.ReadyTimeout); err != nil {
+		return fmt.Errorf("waiting for the site cluster's controller to become healthy: %w", err)
+	}
+	logger.Info("the NVKE stack on the site cluster is healthy")
+	return nil
+}
+
+// siteDeployConfig is the bootstrap cluster's deploy configuration as the site
+// cluster needs it: SPIRE names the site cluster, and nodes the site's
+// controller creates reach SPIRE at the control-plane VIP.
+func siteDeployConfig(inv *sitespec.SiteSpec, seed controllerdeploy.Config) controllerdeploy.Config {
+	cfg := seed
+	cfg.SPIFFEClusterName = inv.ClusterName
+	cfg.SPIREExternalAddress = inv.Cluster.ControlPlaneVIP
+	return cfg
 }
 
 // untaintTimeout bounds the whole untaint: one List and a few Updates.

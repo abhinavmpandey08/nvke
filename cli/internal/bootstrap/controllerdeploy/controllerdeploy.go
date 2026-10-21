@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"text/template"
@@ -1310,6 +1311,34 @@ func (e *Engine) publishSpireExternally(ctx context.Context, kubeconfigPath stri
 	if out, err := e.Runner.Run(ctx, "kubectl", "--kubeconfig", kubeconfigPath,
 		"-n", spireNamespace, "apply", "-f", manifest); err != nil {
 		return fmt.Errorf("controllerdeploy: publishing SPIRE with %s: %w\n%s", spireNodePortFile, err, out)
+	}
+	return nil
+}
+
+// EnsureDefaultStorageClass installs local-path-provisioner as the default
+// StorageClass of the cluster kubeconfigPath points at, unless the cluster
+// already has a default StorageClass.
+func (e *Engine) EnsureDefaultStorageClass(ctx context.Context, kubeconfigPath string) error {
+	out, err := e.Runner.Run(ctx, "kubectl", "--kubeconfig", kubeconfigPath, "get", "storageclass", "-o",
+		`jsonpath={range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}`)
+	if err != nil {
+		return fmt.Errorf("controllerdeploy: listing StorageClasses: %w\n%s", err, out)
+	}
+	if slices.Contains(strings.Fields(out), "true") {
+		return nil
+	}
+	manifest, cleanup, err := writeEmbeddedFile(localPathFile)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	e.log.Info("the cluster has no default StorageClass; installing local-path-provisioner")
+	if out, err := e.Runner.Run(ctx, "kubectl", "--kubeconfig", kubeconfigPath, "apply", "-f", manifest); err != nil {
+		return fmt.Errorf("controllerdeploy: applying %s: %w\n%s", localPathFile, err, out)
+	}
+	if out, err := e.Runner.Run(ctx, "kubectl", "--kubeconfig", kubeconfigPath, "annotate", "storageclass", "local-path",
+		"storageclass.kubernetes.io/is-default-class=true", "--overwrite"); err != nil {
+		return fmt.Errorf("controllerdeploy: making local-path the default StorageClass: %w\n%s", err, out)
 	}
 	return nil
 }
