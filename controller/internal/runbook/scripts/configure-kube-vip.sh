@@ -20,8 +20,8 @@ NODE_IP=${NODE_IP:-""}
 
 # Default kube-vip image pin. These two are a pair — DEFAULT_KUBE_VIP_DIGEST is
 # the multi-arch index digest of DEFAULT_KUBE_VIP_VERSION. Bump them together.
-DEFAULT_KUBE_VIP_VERSION="v1.2.0"
-DEFAULT_KUBE_VIP_DIGEST="sha256:fe8c7b6641ba7633a12b337821e9e83a6456e8edc3434f97577058edd4eecaf6"
+DEFAULT_KUBE_VIP_VERSION="v1.2.4"
+DEFAULT_KUBE_VIP_DIGEST="sha256:dde4c0669d9058c74c69c0bc2f0122e26900e1e4b913c03577cb6e4e28083079"
 
 # Optional environment variables with defaults
 
