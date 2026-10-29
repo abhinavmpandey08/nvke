@@ -46,11 +46,12 @@ var errStopped = errors.New("stopped on a signal")
 // lane of its own. With EnvSiteStackNamespaces set it also checks the NVKE
 // stack on the site cluster, with EnvPivotCluster set that the management
 // plane moved there, and with EnvControllerSPIFFEID set that the controller on
-// the bootstrap cluster runs under that identity. With EnvKnownSecretsFile set
-// it gives nvkectl an OTLP header credential and, once the command exits,
-// searches its log and diagnostics for that and the secrets bootstrap
-// generated. Everything else asserted about the run is still asserted by the
-// lane, over NVKECTL_E2E_BOOTSTRAP_LOG.
+// the bootstrap cluster runs under that identity. With EnvInterruptAt set it
+// kills the run at each marker and continues it with --resume. With
+// EnvKnownSecretsFile set it gives nvkectl an OTLP header credential and, once
+// the command exits, searches its log and diagnostics for that and the secrets
+// bootstrap generated. Everything else asserted about the run is still asserted
+// by the lane, over NVKECTL_E2E_BOOTSTRAP_LOG.
 //
 // The TestE2E_ prefix is how the lanes select it; see the package comment.
 //
@@ -74,7 +75,10 @@ func TestE2E_BootstrapSite(t *testing.T) {
 		t.Fatalf("starting the credential check: %v", err)
 	}
 
-	b, err := bootstraptest.StartBootstrap(context.Background(), opts, t.Logf)
+	// Until stopOnSignal takes over the last run, a signal stops the interrupted ones.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	t.Cleanup(stopSignals)
+	b, err := bootstraptest.StartInterrupted(ctx, opts, bootstraptest.InterruptMarkersFromEnv(), t.Logf)
 	if err != nil {
 		t.Fatalf("starting bootstrap site: %v", err)
 	}
