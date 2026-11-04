@@ -1,0 +1,58 @@
+nico-api:
+  hostname: api.site-a.example.com
+  siteConfig:
+    enabled: true
+    nicoApiSiteConfig: |
+      sitename = "site-a"
+      initial_domain_name = "site-a.example.com"
+      attestation_enabled = false
+      dhcp_servers = ["192.0.2.10"]
+      ntp_servers = ["192.0.2.16", "192.0.2.17", "192.0.2.18"]
+      site_fabric_prefixes = ["10.100.0.0/16"]
+      deny_prefixes = ["10.0.0.0/16"]
+
+      [site_explorer]
+      run_interval = "30s"
+
+      [machine_validation_config]
+      enabled = true
+
+      [firmware_global]
+      autoupdate = false
+
+      [pools.lo-ip]
+      type = "ipv4"
+      ranges = [{ start = "10.200.0.1", end = "10.200.0.254" }]
+
+      [pools.vlan-id]
+      type = "integer"
+      ranges = [{ start = "100", end = "501" }]
+
+      [pools.vni]
+      type = "integer"
+      ranges = [{ start = "1024500", end = "1024800" }]
+
+      [pools.vpc-vni]
+      type = "integer"
+      ranges = [{ start = "0", end = "100" }]
+
+      [networks.admin]
+      type = "admin"
+      prefix = "10.1.0.0/24"
+      gateway = "10.1.0.1"
+      mtu = 9000
+      reserve_first = 5
+
+      [networks.oob]
+      type = "underlay"
+      prefix = "10.2.0.0/24"
+      gateway = "10.2.0.1"
+      mtu = 1500
+      reserve_first = 2
+
+      [networks.inband]
+      type = "hostinband"
+      prefix = "10.3.0.0/24"
+      gateway = "10.3.0.1"
+      mtu = 9000
+      reserve_first = 5

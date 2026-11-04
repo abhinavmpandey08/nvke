@@ -62,6 +62,7 @@ const (
 	pathNodes                = "cluster.nodes"
 	pathNico                 = "infra.nico"
 	pathNicoRemote           = "infra.nico.remote"
+	pathNicoManaged          = "infra.nico.managed"
 	pathNicoControlPlane     = "infra.nico.controlPlane"
 	pathNicoReleases         = "infra.nico.releases"
 	pathK8sVersion           = "cluster.k8sVersion"
@@ -596,7 +597,9 @@ func (inv *SiteSpec) appendReferenceChecks(v *validator) {
 // spec: that the infra.nico.releases manifests can be read and hold the release
 // the control plane's release names, with relative paths resolved from the site
 // spec's directory; that NVKECTL_NICO_CREDENTIALS names a readable NICo
-// credentials file; and that NVKECTL_NODE_USER and NVKECTL_NODE_PASSWORD are set.
+// credentials file or, for infra.nico.managed, that the NICo settings load and
+// the secrets they need are set; and that NVKECTL_NODE_USER and
+// NVKECTL_NODE_PASSWORD are set.
 //
 // Load does not call it, because Load also serves commands that never run the
 // bootstrap: the controller stack install on the site node, through

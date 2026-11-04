@@ -13,6 +13,7 @@ import (
 	openapi_types "github.com/oapi-codegen/runtime/types"
 	"gopkg.in/yaml.v3"
 
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
 	api "github.com/dsx-ai-factory/nvke/controller/api"
 )
 
@@ -50,25 +51,42 @@ type Infra struct {
 
 // NicoInfra describes the control-plane machines CAPNICo allocates for the site
 // cluster and what the bootstrap needs to create them. Where the NICo is comes
-// from exactly one mode block; Remote is the only one today, and another would
-// sit beside it as a sibling field, so adding one changes nothing here.
+// from exactly one mode block: Remote or Managed.
 //
 // Credentials for the NICo API are not part of it: they are read from the file
 // the NVKECTL_NICO_CREDENTIALS variable names.
 type NicoInfra struct {
 	// OrgID is the NICo organization the machines are created in. It sits above
-	// the mode block because every mode has one.
+	// the mode block because every mode has one. Required with Remote.
 	OrgID string `yaml:"orgID,omitempty"`
 	// ControlPlane is what the control-plane machines are built with.
 	ControlPlane NicoControlPlane `yaml:"controlPlane"`
 	// Remote is an existing NICo, which the bootstrap CAPNICo reaches at its
-	// endpoint with the credentials in NVKECTL_NICO_CREDENTIALS. Required.
+	// endpoint with the credentials in NVKECTL_NICO_CREDENTIALS.
 	Remote *NicoRemote `yaml:"remote,omitempty"`
 	// Releases is a file, or a directory of files, holding the MachineImage and
 	// ClusterRelease manifests the bootstrap applies to the Kind cluster before
 	// it creates the site cluster. The controller resolves the control plane's
 	// release from them. Required.
 	Releases string `yaml:"releases,omitempty"`
+	// Managed is a NICo the bootstrap installs in the bootstrap cluster.
+	Managed *NicoManaged `yaml:"managed,omitempty"`
+}
+
+// NicoManaged is a NICo the bootstrap installs.
+type NicoManaged struct {
+	// Settings is the NICo settings file: how the bootstrap installs NICo,
+	// ingests the site's machines and hands NICo over. Required.
+	Settings string `yaml:"settings"`
+}
+
+// NicoSettingsPath returns the NICo settings file's path, resolved like the
+// site spec's other paths, or "" when the bootstrap installs no NICo.
+func (inv *SiteSpec) NicoSettingsPath() string {
+	if !inv.IsManagedNico() {
+		return ""
+	}
+	return inv.ResolvePath(inv.Infra.Nico.Managed.Settings)
 }
 
 // NicoRemote is an existing NICo.
@@ -141,6 +159,12 @@ func (inv *SiteSpec) IsNico() bool {
 	return inv.Infra.Provider == ProviderNico
 }
 
+// IsManagedNico reports whether the bootstrap installs the NICo the cluster's
+// machines are allocated from.
+func (inv *SiteSpec) IsManagedNico() bool {
+	return inv.IsNico() && inv.Infra.Nico != nil && inv.Infra.Nico.Managed != nil
+}
+
 // ControlPlaneCount returns how many control-plane nodes the site cluster is
 // built from: the length of cluster.nodes, or infra.nico.controlPlane.count
 // when the machines are allocated from NICo.
@@ -199,12 +223,21 @@ func (v *validator) checkNico(n *NicoInfra) {
 		v.addf("%s is required with %s: %q", pathNico, pathInfraProvider, ProviderNico)
 		return
 	}
-	if n.OrgID == "" {
-		v.addf("%s.orgID is required", pathNico)
-	}
-	if n.Remote == nil {
-		v.addf("%s.remote is required: it is the existing NICo the bootstrap CAPNICo calls", pathNico)
-	} else {
+	switch {
+	case n.Remote != nil && n.Managed != nil:
+		v.addf("%s sets both remote and managed; set remote for an existing NICo or managed for one the bootstrap installs", pathNico)
+	case n.Remote == nil && n.Managed == nil:
+		v.addf("%s must set remote, for an existing NICo, or managed, for one the bootstrap installs", pathNico)
+	case n.Managed != nil:
+		if n.Managed.Settings == "" {
+			v.addf("%s.settings is required: it names the NICo settings file", pathNicoManaged)
+		}
+		// The bootstrap creates the NICo objects the remote block names by ID.
+		v.checkNicoControlPlaneShape(n.ControlPlane)
+	default:
+		if n.OrgID == "" {
+			v.addf("%s.orgID is required", pathNico)
+		}
 		switch {
 		case n.Remote.Endpoint == "":
 			v.addf("%s.endpoint is required", pathNicoRemote)
@@ -217,20 +250,31 @@ func (v *validator) checkNico(n *NicoInfra) {
 		if name := n.Remote.APIName; name != "" && (len(name) > 63 || !dnsLabelRE.MatchString(name)) {
 			v.addf("%s.apiName %q must be a lowercase name such as forge or carbide", pathNicoRemote, name)
 		}
+		v.checkNicoControlPlane(n.ControlPlane)
 	}
-	v.checkNicoControlPlane(n.ControlPlane)
 	if n.Releases == "" {
 		v.addf("%s is required: the controller resolves %s.release from the MachineImage and ClusterRelease manifests in it",
 			pathNicoReleases, pathNicoControlPlane)
 	}
 }
 
-func (v *validator) checkNicoControlPlane(cp NicoControlPlane) {
+// checkNicoControlPlaneShape checks what every mode's control plane needs: a
+// count etcd can keep quorum with, and a release.
+func (v *validator) checkNicoControlPlaneShape(cp NicoControlPlane) {
 	if cp.Count < 1 {
 		v.addf("%s.count must be at least 1", pathNicoControlPlane)
 	} else if cp.Count%2 == 0 {
 		v.addf("%s.count must be an odd number", pathNicoControlPlane)
 	}
+	if cp.Release == "" {
+		v.addf("%s.release is required", pathNicoControlPlane)
+	}
+}
+
+// checkNicoControlPlane checks the control plane for an existing NICo, whose
+// instance types, networks and SSH key groups the site spec names by ID.
+func (v *validator) checkNicoControlPlane(cp NicoControlPlane) {
+	v.checkNicoControlPlaneShape(cp)
 	const cpPath = pathNicoControlPlane
 	if len(cp.InstanceTypePreference) == 0 {
 		v.addf("%s.instanceTypePreference must list at least one instance type ID", cpPath)
@@ -248,9 +292,6 @@ func (v *validator) checkNicoControlPlane(cp NicoControlPlane) {
 	case len(cp.VpcPrefixIDs) > 0 && len(cp.SubnetIDs) > 0:
 		v.addf("%s must set only one of vpcPrefixIDs and subnetIDs", cpPath)
 	}
-	if cp.Release == "" {
-		v.addf("%s.release is required", cpPath)
-	}
 	// configProfile is optional. The bootstrap controller's profiles directory is
 	// empty unless NVKECTL_NVKE_CONTROLLER_PROFILES_IMAGE fills it, so a name
 	// otherwise never resolves and the controller treats it as an empty profile,
@@ -266,10 +307,19 @@ func (v *validator) checkNicoFiles(inv *SiteSpec) {
 		return
 	}
 	v.checkBootstrapReleases(inv)
+	if path := inv.NicoSettingsPath(); path != "" {
+		if f, err := os.Open(path); err != nil {
+			v.addf("%s.settings: %v", pathNicoManaged, err)
+		} else {
+			_ = f.Close()
+		}
+	}
 }
 
-// checkNicoCredentials checks the file NVKECTL_NICO_CREDENTIALS names. It is not
-// part of the site spec, so only the commands that run the bootstrap look.
+// checkNicoCredentials checks the file NVKECTL_NICO_CREDENTIALS names or, for
+// a NICo the bootstrap installs, the NICo settings and the secrets they need
+// from the environment. Neither is part of the site spec, so only the commands
+// that run the bootstrap look.
 func (v *validator) checkNicoCredentials(inv *SiteSpec) {
 	if !inv.IsNico() {
 		return
@@ -279,6 +329,16 @@ func (v *validator) checkNicoCredentials(inv *SiteSpec) {
 		for _, problem := range strings.Split(err.Error(), "\n") {
 			v.addf("%s", problem)
 		}
+	}
+	// The bootstrap creates the credentials for a NICo it installs.
+	if inv.IsManagedNico() {
+		if os.Getenv(NicoInsecureEndpointEnv) != "1" {
+			v.addf("%s: the NICo the bootstrap installs serves its REST API and the bundled Keycloak's token endpoint over http, "+
+				"so NICo tokens and client secrets cross the site network in cleartext; set %s=1 to accept that",
+				pathNicoManaged, NicoInsecureEndpointEnv)
+		}
+		v.checkNicoSettings(inv)
+		return
 	}
 	path := NicoCredentialsPath()
 	if path == "" {
@@ -294,6 +354,27 @@ func (v *validator) checkNicoCredentials(inv *SiteSpec) {
 	if u, err := url.Parse(creds.TokenURL); err == nil && u.Scheme == "http" && os.Getenv(NicoInsecureEndpointEnv) != "1" {
 		v.addf("%s: the tokenURL is http, so the client secret would be sent in cleartext; use https, or set %s=1 for a local or simulated NICo",
 			NicoCredentialsEnv, NicoInsecureEndpointEnv)
+	}
+}
+
+// checkNicoSettings loads the NICo settings and reads the secrets they need,
+// adding each problem. A settings file that cannot be opened is checkNicoFiles' to report.
+func (v *validator) checkNicoSettings(inv *SiteSpec) {
+	path := inv.NicoSettingsPath()
+	if path == "" {
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	settings, err := nicosettings.Load(path)
+	if err == nil {
+		_, err = nicosettings.SecretsFromEnv(settings)
+	}
+	if err != nil {
+		for _, problem := range strings.Split(err.Error(), "\n") {
+			v.addf("%s.settings: %s", pathNicoManaged, problem)
+		}
 	}
 }
 

@@ -25,7 +25,8 @@ const (
 	// NicoInsecureEndpointEnv, set to 1, lets infra.nico.remote.endpoint and
 	// the credentials' tokenURL be http URLs. The bootstrap sends the NICo
 	// bearer token or client secret to them, so without it only https is
-	// accepted; it is for a local or simulated NICo.
+	// accepted; it is for a local or simulated NICo. infra.nico.managed needs
+	// it too: the NICo the bootstrap installs serves REST over http.
 	NicoInsecureEndpointEnv = "NVKECTL_NICO_ALLOW_INSECURE_ENDPOINT"
 
 	// DefaultNicoAPIName is the API name in the NICo API path that CAPNICo is

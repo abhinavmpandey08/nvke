@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
 	"github.com/dsx-ai-factory/nvke/cli/internal/deploypath/stackconfig"
 	api "github.com/dsx-ai-factory/nvke/controller/api"
 )
@@ -1067,9 +1068,39 @@ func TestValidate_Infrastructure(t *testing.T) {
 			wantErr: "infra.nico.releases is required",
 		},
 		{
-			name:    "nico without a remote",
+			name:    "nico without a remote or managed",
 			mutate:  func(inv *SiteSpec) { makeNico(inv); inv.Infra.Nico.Remote = nil },
-			wantErr: "infra.nico.remote is required",
+			wantErr: "infra.nico must set remote, for an existing NICo, or managed",
+		},
+		{
+			name:    "nico with both remote and managed",
+			mutate:  func(inv *SiteSpec) { makeNico(inv); inv.Infra.Nico.Managed = &NicoManaged{} },
+			wantErr: "infra.nico sets both remote and managed",
+		},
+		{
+			name: "managed nico needs no NICo IDs, org or credentials",
+			mutate: func(inv *SiteSpec) {
+				makeNico(inv)
+				inv.Infra.Nico = managedNico()
+			},
+		},
+		{
+			name: "managed nico needs its settings file",
+			mutate: func(inv *SiteSpec) {
+				makeNico(inv)
+				inv.Infra.Nico = managedNico()
+				inv.Infra.Nico.Managed.Settings = ""
+			},
+			wantErr: "infra.nico.managed.settings is required",
+		},
+		{
+			name: "managed nico still needs a release",
+			mutate: func(inv *SiteSpec) {
+				makeNico(inv)
+				inv.Infra.Nico = managedNico()
+				inv.Infra.Nico.ControlPlane.Release = ""
+			},
+			wantErr: "infra.nico.controlPlane.release is required",
 		},
 		{
 			name:    "remote endpoint is not a URL",
@@ -1176,6 +1207,18 @@ func TestValidate_NicoConfigProfileIsOptional(t *testing.T) {
 // uid returns the UUID 00000000-0000-0000-0000-00000000000n.
 func uid(n byte) openapi_types.UUID { return openapi_types.UUID{15: n} }
 
+// managedNico is a NICo the bootstrap installs: no remote, org or NICo IDs.
+func managedNico() *NicoInfra {
+	return &NicoInfra{
+		Managed: &NicoManaged{Settings: "nico-settings.yaml"},
+		ControlPlane: NicoControlPlane{
+			Count:                          3,
+			NicoControlPlaneProviderCreate: api.NicoControlPlaneProviderCreate{Release: "example-os-profile"},
+		},
+		Releases: "releases",
+	}
+}
+
 // validNico is built with the API's own struct for the control-plane block, as
 // the site spec's is.
 func validNico() *NicoInfra {
@@ -1253,6 +1296,95 @@ func TestValidateBootstrapReferences_FilesMustExist(t *testing.T) {
 	if err := inv.ValidateBootstrapReferences(); err == nil || !strings.Contains(err.Error(), NicoCredentialsEnv+": ") {
 		t.Errorf("ValidateBootstrapReferences with a missing credentials file = %v", err)
 	}
+}
+
+// TestValidateBootstrapReferences_ManagedNicoNeedsNoCredentialsFile: the
+// bootstrap creates the credentials for a NICo it installs, but the node login
+// and the NICo settings file are still the operator's.
+func TestValidateBootstrapReferences_ManagedNicoNeedsNoCredentialsFile(t *testing.T) {
+	inv := minimalValid()
+	inv.Cluster.Nodes = nil
+	inv.Infra.Provider = ProviderNico
+	inv.Infra.Nico = managedNico()
+	inv.Infra.Nico.Releases = ""
+	inv.dir = t.TempDir()
+
+	t.Setenv(NicoCredentialsEnv, "")
+	t.Setenv(stackconfig.EnvNodeUser, "")
+	t.Setenv(stackconfig.EnvNodePassword, "")
+	err := inv.ValidateBootstrapReferences()
+	for _, want := range []string{stackconfig.EnvNodeUser + " is not set", "infra.nico.managed.settings: open "} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("ValidateBootstrapReferences error = %v, want it to report %q", err, want)
+		}
+	}
+	if err != nil && strings.Contains(err.Error(), NicoCredentialsEnv) {
+		t.Errorf("ValidateBootstrapReferences error = %v, want no %s for a managed NICo", err, NicoCredentialsEnv)
+	}
+}
+
+// TestValidateBootstrapReferences_ManagedNicoSettings: the NICo settings are
+// loaded, and each problem with them or with the secrets they need from the
+// environment is reported against infra.nico.managed.settings.
+func TestValidateBootstrapReferences_ManagedNicoSettings(t *testing.T) {
+	settings, err := filepath.Abs(filepath.Join("..", "nicosettings", "testdata", "settings.yaml"))
+	require.NoError(t, err)
+	newSpec := func(t *testing.T) *SiteSpec {
+		dir := t.TempDir()
+		writeNicoFiles(t, dir, "unused.token", "releases")
+		inv := minimalValid()
+		inv.Cluster.Nodes = nil
+		inv.Infra.Provider = ProviderNico
+		inv.Infra.Nico = managedNico()
+		inv.Infra.Nico.Managed.Settings = settings
+		inv.dir = dir
+		return inv
+	}
+	setSecrets := func(t *testing.T) {
+		t.Setenv(NicoInsecureEndpointEnv, "1")
+		t.Setenv(stackconfig.EnvNodeUser, "example-user")
+		t.Setenv(stackconfig.EnvNodePassword, "example-password")
+		for _, env := range []string{
+			nicosettings.SiteWideBMCRootPasswordEnv, nicosettings.HostUEFIPasswordEnv, nicosettings.DPUUEFIPasswordEnv,
+			"NICO_BMC_EXAMPLE_USERNAME", "NICO_BMC_EXAMPLE_PASSWORD",
+		} {
+			t.Setenv(env, "example-value")
+		}
+	}
+
+	t.Run("valid settings with their secrets", func(t *testing.T) {
+		setSecrets(t)
+		inv := newSpec(t)
+		assert.Equal(t, settings, inv.NicoSettingsPath())
+		assert.NoError(t, inv.ValidateBootstrapReferences())
+	})
+	t.Run("http without the opt-in", func(t *testing.T) {
+		setSecrets(t)
+		t.Setenv(NicoInsecureEndpointEnv, "")
+		err := newSpec(t).ValidateBootstrapReferences()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "infra.nico.managed: the NICo the bootstrap installs serves its REST API")
+		assert.Contains(t, err.Error(), NicoInsecureEndpointEnv+"=1")
+	})
+	t.Run("a missing secret", func(t *testing.T) {
+		setSecrets(t)
+		t.Setenv(nicosettings.SiteWideBMCRootPasswordEnv, "")
+		err := newSpec(t).ValidateBootstrapReferences()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "infra.nico.managed.settings: "+nicosettings.SiteWideBMCRootPasswordEnv+" is not set")
+	})
+}
+
+// TestNicoSettingsPath: the settings path resolves from the site spec's
+// directory, and is empty when the bootstrap installs no NICo.
+func TestNicoSettingsPath(t *testing.T) {
+	inv := minimalValid()
+	assert.Empty(t, inv.NicoSettingsPath())
+	makeNico(inv)
+	assert.Empty(t, inv.NicoSettingsPath())
+	inv.Infra.Nico = managedNico()
+	inv.dir = "/srv/site"
+	assert.Equal(t, "/srv/site/nico-settings.yaml", inv.NicoSettingsPath())
 }
 
 // TestLoad_RejectsTheNicoTenantBlock: the node login is a credential, so it is

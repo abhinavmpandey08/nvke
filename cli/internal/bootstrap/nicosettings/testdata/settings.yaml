@@ -1,0 +1,30 @@
+# A complete NICo settings file for the site cluster site-a.
+apiHostname: api.site-a.example.com
+coreValues: nico-core.yaml
+machines: machines.yaml
+images:
+  registry: registry.example.com/nico
+  coreTag: v2.2.2
+  restTag: v2.2.2
+  bootArtifactsX86_64: registry.example.com/nico/boot-artifacts-x86_64:v2.2.2
+  bootArtifactsAarch64: registry.example.com/nico/boot-artifacts-aarch64:v2.2.2
+  machineValidation: registry.example.com/nico/machine-validation-config:v2.2.2
+  unbound: registry.example.com/nico/unbound:1.20.0
+  unboundExporter: registry.example.com/nico/unbound_exporter:0.4.6
+addresses:
+  dhcp: 192.0.2.10
+  pxe: 192.0.2.11
+  api: 192.0.2.12
+  rest: 192.0.2.13
+  keycloak: 192.0.2.14
+  dns: 192.0.2.15
+  ntp: [192.0.2.16, 192.0.2.17, 192.0.2.18]
+upstreamDNS: [198.51.100.53]
+site:
+  storageClass: example-storage
+allocation:
+  vpcType: ethernetVirtualizer
+  tenantBlockPrefixLength: 24
+  subnetPrefixLength: 26
+  sshPublicKey: id.pub
+handoverDir: handover
