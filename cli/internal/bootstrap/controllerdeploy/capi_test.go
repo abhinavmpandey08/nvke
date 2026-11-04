@@ -457,37 +457,110 @@ func TestPinnedCAPNICoImage(t *testing.T) {
 // 20-nico-credentials template renders, that no pull secret is created for the
 // public image, and that values needing escaping survive it.
 func TestCAPNICoSecretsManifest(t *testing.T) {
-	access := nicoTestConfig(t).CAPNICo
-	access.Token = `tok"en\with-escapes`
+	base := nicoTestConfig(t).CAPNICo
+	clientCreds := base
+	clientCreds.Token = ""
+	clientCreds.TokenURL = "http://192.0.2.20:8082/realms/nico/protocol/openid-connect/token"
+	clientCreds.ClientID = "ncx-service"
+	clientCreds.ClientSecret = `sec"ret\with-escapes`
+	withToken := base
+	withToken.Token = `tok"en\with-escapes`
 
-	raw, err := capnicoSecretsManifest(access)
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name     string
+		access   CAPNICoAccess
+		wantData map[string]string
+	}{
+		{
+			name:   "static token",
+			access: withToken,
+			wantData: map[string]string{
+				"endpoint": base.Endpoint, "orgID": base.OrgID, "apiName": base.APIName, "token": withToken.Token,
+			},
+		},
+		{
+			name:   "client credentials",
+			access: clientCreds,
+			wantData: map[string]string{
+				"endpoint": base.Endpoint, "orgID": base.OrgID, "apiName": base.APIName,
+				"tokenURL": clientCreds.TokenURL, "clientID": clientCreds.ClientID, "clientSecret": clientCreds.ClientSecret,
+			},
+		},
 	}
-	var list struct {
-		Items []struct {
-			Kind     string
-			Metadata struct{ Name, Namespace string }
-			Data     map[string]string `json:"stringData"`
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, err := capnicoSecretsManifest(tt.access)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var list struct {
+				Items []struct {
+					Kind     string
+					Metadata struct{ Name, Namespace string }
+					Data     map[string]string `json:"stringData"`
+				}
+			}
+			if err := json.Unmarshal(raw, &list); err != nil {
+				t.Fatalf("not JSON: %v\n%s", err, raw)
+			}
+			if len(list.Items) != 2 {
+				t.Fatalf("want a Namespace and the credentials Secret, got %d items", len(list.Items))
+			}
+			if ns := list.Items[0]; ns.Kind != "Namespace" || ns.Metadata.Name != capnicoNamespace {
+				t.Errorf("first item = %+v, want the %s Namespace", ns, capnicoNamespace)
+			}
+			creds := list.Items[1]
+			if creds.Metadata.Name != nicoCredentialsSecret || creds.Metadata.Namespace != capnicoNamespace {
+				t.Errorf("credentials Secret = %+v", creds.Metadata)
+			}
+			// Exactly these keys: CAPNICo refuses a Secret with both a token and client credentials.
+			if len(creds.Data) != len(tt.wantData) {
+				t.Errorf("nico-credentials keys = %v, want %v", creds.Data, tt.wantData)
+			}
+			for key, want := range tt.wantData {
+				if creds.Data[key] != want {
+					t.Errorf("nico-credentials[%s] = %q, want %q", key, creds.Data[key], want)
+				}
+			}
+		})
 	}
-	if err := json.Unmarshal(raw, &list); err != nil {
-		t.Fatalf("not JSON: %v\n%s", err, raw)
+}
+
+func TestCAPNICoSecretsManifest_Errors(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*CAPNICoAccess)
+		wantErr string
+	}{
+		{name: "no login", mutate: func(a *CAPNICoAccess) { a.Token = "" }, wantErr: "CAPNICo.Token"},
+		{name: "no endpoint", mutate: func(a *CAPNICoAccess) { a.Endpoint = "" }, wantErr: "CAPNICo.Endpoint"},
+		{
+			name:    "token and client credentials",
+			mutate:  func(a *CAPNICoAccess) { a.ClientID = "ncx-service" },
+			wantErr: "not both",
+		},
+		{
+			name: "client credentials without a secret",
+			mutate: func(a *CAPNICoAccess) {
+				a.Token, a.TokenURL, a.ClientID = "", "http://192.0.2.20:8082/token", "ncx-service"
+			},
+			wantErr: "CAPNICo.ClientSecret",
+		},
+		{
+			name:    "client credentials without a token URL",
+			mutate:  func(a *CAPNICoAccess) { a.Token, a.ClientID, a.ClientSecret = "", "ncx-service", "example-secret" },
+			wantErr: "CAPNICo.TokenURL",
+		},
 	}
-	if len(list.Items) != 2 {
-		t.Fatalf("want a Namespace and the credentials Secret, got %d items", len(list.Items))
-	}
-	if ns := list.Items[0]; ns.Kind != "Namespace" || ns.Metadata.Name != capnicoNamespace {
-		t.Errorf("first item = %+v, want the %s Namespace", ns, capnicoNamespace)
-	}
-	creds := list.Items[1]
-	if creds.Metadata.Name != nicoCredentialsSecret || creds.Metadata.Namespace != capnicoNamespace {
-		t.Errorf("credentials Secret = %+v", creds.Metadata)
-	}
-	for key, want := range map[string]string{"endpoint": access.Endpoint, "orgID": access.OrgID, "apiName": access.APIName, "token": access.Token} {
-		if creds.Data[key] != want {
-			t.Errorf("nico-credentials[%s] = %q, want %q", key, creds.Data[key], want)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			access := nicoTestConfig(t).CAPNICo
+			tt.mutate(&access)
+			_, err := capnicoSecretsManifest(access)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("capnicoSecretsManifest error = %v, want one containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 

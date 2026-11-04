@@ -1301,45 +1301,72 @@ func TestValidateBootstrapReferences_HTTPEndpointNeedsOptIn(t *testing.T) {
 	}
 }
 
-// TestReadNicoToken: the credentials file's format is told from its content. A
-// bare token is the bearer token; the client-credentials form is recognised and
-// refused until CAPNICo can take it; anything else is not a token.
-func TestReadNicoToken(t *testing.T) {
+// TestReadNicoCredentials: the credentials file's format is told from its
+// content. A bare token is the bearer token; a map with tokenURL, clientID or
+// clientSecret is the client-credentials form and needs all three.
+func TestReadNicoCredentials(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		content string
-		want    string
+		want    NicoCredentials
 		wantErr string
 	}{
-		{"a bare token", "example-token", "example-token", ""},
-		{"a token with a trailing newline", "example-token\n", "example-token", ""},
-		{"a JWT", "aaa.bbb.ccc=", "aaa.bbb.ccc=", ""},
-		{"empty", "  \n", "", "is empty"},
-		{"two values", "one two\n", "", "one value with no whitespace"},
-		{"client credentials as YAML", "tokenURL: https://idp.example/token\nclientID: id\nclientSecret: secret\n", "", "client-credentials form is not supported"},
-		{"client credentials as JSON", `{"tokenURL": "https://idp.example/token", "clientID": "id", "clientSecret": "s"}`, "", "client-credentials form is not supported"},
-		{"client credentials as KEY=VALUE", "clientID=id\nclientSecret=secret\n", "", "client-credentials form is not supported"},
+		{"a bare token", "example-token", NicoCredentials{Token: "example-token"}, ""},
+		{"a token with a trailing newline", "example-token\n", NicoCredentials{Token: "example-token"}, ""},
+		{"a JWT", "aaa.bbb.ccc=", NicoCredentials{Token: "aaa.bbb.ccc="}, ""},
+		{"empty", "  \n", NicoCredentials{}, "is empty"},
+		{"two values", "one two\n", NicoCredentials{}, "one value with no whitespace"},
+		{
+			"client credentials as YAML", "tokenURL: https://idp.example/token\nclientID: id\nclientSecret: example-secret\n",
+			NicoCredentials{TokenURL: "https://idp.example/token", ClientID: "id", ClientSecret: "example-secret"},
+			"",
+		},
+		{
+			"client credentials as JSON", `{"tokenURL": "http://idp.example/token", "clientID": "id", "clientSecret": "example-secret"}`,
+			NicoCredentials{TokenURL: "http://idp.example/token", ClientID: "id", ClientSecret: "example-secret"},
+			"",
+		},
+		{"client credentials without a token URL", "clientID: id\nclientSecret: example-secret\n", NicoCredentials{}, "missing: tokenURL"},
+		{"client credentials with a token URL that is not a URL", "tokenURL: idp.example\nclientID: id\nclientSecret: example-secret\n", NicoCredentials{}, "must be an http or https URL"},
+		{"client credentials as KEY=VALUE", "clientID=id\nclientSecret=example-secret\n", NicoCredentials{}, "not a YAML or JSON map"},
+		{"client credentials with an unknown key", "tokenURL: https://idp.example/token\nclientID: id\nclientSecret: example-secret\nscope: example-secret\n", NicoCredentials{}, "not a YAML or JSON map"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "credentials")
-			if err := os.WriteFile(path, []byte(tt.content), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			got, err := ReadNicoToken(path)
+			require.NoError(t, os.WriteFile(path, []byte(tt.content), 0o600))
+			got, err := ReadNicoCredentials(path)
 			if tt.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("ReadNicoToken error = %v, want it to contain %q", err, tt.wantErr)
-				}
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				assert.NotContains(t, err.Error(), "example-secret")
 				return
 			}
-			if err != nil || got != tt.want {
-				t.Fatalf("ReadNicoToken = %q, %v; want %q", got, err, tt.want)
-			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
-	if _, err := ReadNicoToken(filepath.Join(t.TempDir(), "absent")); err == nil {
-		t.Error("ReadNicoToken of a missing file succeeded")
+	if _, err := ReadNicoCredentials(filepath.Join(t.TempDir(), "absent")); err == nil {
+		t.Error("ReadNicoCredentials of a missing file succeeded")
 	}
+}
+
+// TestValidateBootstrapReferences_HTTPTokenURLNeedsOptIn: the client secret is
+// sent to the tokenURL, so an http one needs the same opt-in as an http endpoint.
+func TestValidateBootstrapReferences_HTTPTokenURLNeedsOptIn(t *testing.T) {
+	inv, err := Load(writeNicoTemp(t, nicoYAML))
+	require.NoError(t, err)
+	creds := filepath.Join(t.TempDir(), "credentials")
+	require.NoError(t, os.WriteFile(creds, []byte("tokenURL: http://idp.example/token\nclientID: id\nclientSecret: example-secret\n"), 0o600))
+	t.Setenv(NicoCredentialsEnv, creds)
+
+	t.Setenv(NicoInsecureEndpointEnv, "")
+	err = inv.ValidateBootstrapReferences()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "the tokenURL is http")
+	assert.NotContains(t, err.Error(), "example-secret")
+
+	t.Setenv(NicoInsecureEndpointEnv, "1")
+	assert.NoError(t, inv.ValidateBootstrapReferences())
 }
 
 // TestNicoCredentials_OldNamesStillWork: NVKECTL_NICO_CREDENTIALS is read under
@@ -1371,8 +1398,8 @@ func TestNicoCredentials_OldNamesStillWork(t *testing.T) {
 // gets an error that does not echo the token.
 func TestNicoCredentials_ATokenInTheVariableIsNotPrinted(t *testing.T) {
 	const token = "eyJhbGciOiJSUzI1NiJ9.sentinel-nico-token.c2lnbmF0dXJl"
-	if _, err := ReadNicoToken(token); err == nil || strings.Contains(err.Error(), token) || !strings.Contains(err.Error(), "not the token itself") {
-		t.Errorf("ReadNicoToken(token) error = %v; want one that says what is wrong without the token", err)
+	if _, err := ReadNicoCredentials(token); err == nil || strings.Contains(err.Error(), token) || !strings.Contains(err.Error(), "not the token itself") {
+		t.Errorf("ReadNicoCredentials(token) error = %v; want one that says what is wrong without the token", err)
 	}
 
 	inv, err := Load(writeNicoTemp(t, nicoYAML))

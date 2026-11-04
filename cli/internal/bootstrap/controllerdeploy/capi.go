@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/manifest"
+	"github.com/dsx-ai-factory/nvke/cli/internal/redact"
 )
 
 // capiVersion is injected by cli/Makefile from CAPI_VERSION in
@@ -97,11 +98,11 @@ func (e *Engine) installCAPI(ctx context.Context, kubeconfigPath string, cfg Con
 	return e.installProvisionedProvider(ctx, kubeconfigPath, cfg, timeout)
 }
 
-// CAPNICoAccess is what the bootstrap CAPNICo needs from the operator: the
-// NICo API it calls. Endpoint, OrgID and APIName come from the site spec's
-// infra.nico, the API name defaulting to sitespec.DefaultNicoAPIName, and Token
-// is read from the file NVKECTL_NICO_CREDENTIALS names. Its image is public, so no registry
-// credential is needed.
+// CAPNICoAccess is what the bootstrap CAPNICo needs to call the NICo API:
+// Endpoint, OrgID and APIName, and exactly one of two logins: a static Token,
+// or the OAuth2 client credentials TokenURL, ClientID and ClientSecret, which
+// CAPNICo exchanges for tokens itself and so outlive a token's lifetime. Its
+// image is public, so no registry credential is needed.
 type CAPNICoAccess struct {
 	// Endpoint, OrgID, APIName and Token are the keys of the nico-credentials
 	// Secret.
@@ -109,6 +110,11 @@ type CAPNICoAccess struct {
 	OrgID    string
 	APIName  string
 	Token    string
+	// TokenURL, ClientID and ClientSecret are the Secret's keys of the same
+	// names. Set all three, or none and Token.
+	TokenURL     string
+	ClientID     string
+	ClientSecret string
 }
 
 // installCAPNICo installs CAPNICo the way the site controller's deploy path
@@ -126,6 +132,8 @@ type CAPNICoAccess struct {
 // The credentials are applied first, in a file with their namespace, because
 // the manager reads them as soon as the manifest starts it.
 func (e *Engine) installCAPNICo(ctx context.Context, kubeconfigPath string, cfg Config, timeout time.Duration) error {
+	redact.RegisterSecret(cfg.CAPNICo.Token)
+	redact.RegisterSecret(cfg.CAPNICo.ClientSecret)
 	secrets, err := capnicoSecretsManifest(cfg.CAPNICo)
 	if err != nil {
 		return err
@@ -288,27 +296,44 @@ func capnicoManifest(raw []byte, image string) ([]byte, error) {
 // capnicoSecretsManifest renders the Namespace and the nico-credentials Secret
 // as one JSON document, which kubectl applies as it does YAML. The Secret
 // carries the same keys the deploy path's 20-nico-credentials.yaml.tmpl
-// renders.
+// renders, with the client credentials in place of the token when they are
+// given. CAPNICo refuses a Secret holding both.
 //
 // It is built with encoding/json rather than a template so a value holding a
 // quote or a backslash is carried, not written altered.
 func capnicoSecretsManifest(a CAPNICoAccess) ([]byte, error) {
-	for _, f := range []struct{ name, value string }{
+	required := []struct{ name, value string }{
 		{"Endpoint", a.Endpoint},
 		{"OrgID", a.OrgID},
 		{"APIName", a.APIName},
-		{"Token", a.Token},
-	} {
+	}
+	clientCredentials := a.TokenURL != "" || a.ClientID != "" || a.ClientSecret != ""
+	switch {
+	case clientCredentials && a.Token != "":
+		return nil, errors.New("controllerdeploy: Config.CAPNICo takes a Token or client credentials, not both")
+	case clientCredentials:
+		required = append(required,
+			struct{ name, value string }{"TokenURL", a.TokenURL},
+			struct{ name, value string }{"ClientID", a.ClientID},
+			struct{ name, value string }{"ClientSecret", a.ClientSecret})
+	default:
+		required = append(required, struct{ name, value string }{"Token", a.Token})
+	}
+	for _, f := range required {
 		if f.value == "" {
 			return nil, fmt.Errorf("controllerdeploy: Config.CAPNICo.%s is required to install CAPNICo", f.name)
 		}
 	}
+	data := map[string]string{"endpoint": a.Endpoint, "orgID": a.OrgID, "apiName": a.APIName}
+	if clientCredentials {
+		data["tokenURL"], data["clientID"], data["clientSecret"] = a.TokenURL, a.ClientID, a.ClientSecret
+	} else {
+		data["token"] = a.Token
+	}
 	secret := map[string]any{
 		"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
-		"metadata": map[string]any{"name": nicoCredentialsSecret, "namespace": capnicoNamespace},
-		"stringData": map[string]string{
-			"endpoint": a.Endpoint, "orgID": a.OrgID, "token": a.Token, "apiName": a.APIName,
-		},
+		"metadata":   map[string]any{"name": nicoCredentialsSecret, "namespace": capnicoNamespace},
+		"stringData": data,
 	}
 	out, err := json.Marshal(map[string]any{
 		"apiVersion": "v1", "kind": "List",

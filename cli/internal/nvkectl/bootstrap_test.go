@@ -2268,8 +2268,8 @@ func TestControllerImageOrder(t *testing.T) {
 }
 
 // TestCapnicoAccess: the bootstrap CAPNICo's endpoint and organization come from
-// the site spec's infra.nico, its token from the file NVKECTL_NICO_CREDENTIALS
-// names, and only for the nico provider.
+// the site spec's infra.nico, its token or client credentials from the file
+// NVKECTL_NICO_CREDENTIALS names, and only for the nico provider.
 func TestCapnicoAccess(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, body string) string {
@@ -2309,6 +2309,20 @@ func TestCapnicoAccess(t *testing.T) {
 			t.Errorf("capnicoAccess = %+v, want %+v", got, want)
 		}
 	})
+	t.Run("nico reads client credentials", func(t *testing.T) {
+		t.Setenv(sitespec.NicoCredentialsEnv, structured)
+		got, err := capnicoAccess(nico)
+		if err != nil {
+			t.Fatalf("capnicoAccess: %v", err)
+		}
+		want := controllerdeploy.CAPNICoAccess{
+			Endpoint: "https://nico.example", OrgID: "example-org", APIName: sitespec.DefaultNicoAPIName,
+			TokenURL: "https://idp.example/token", ClientID: "id", ClientSecret: "secret",
+		}
+		if got != want {
+			t.Errorf("capnicoAccess = %+v, want %+v", got, want)
+		}
+	})
 	t.Run("nico takes the site spec's API name", func(t *testing.T) {
 		t.Setenv(sitespec.NicoCredentialsEnv, nicoToken)
 		carbide := *nico
@@ -2328,7 +2342,6 @@ func TestCapnicoAccess(t *testing.T) {
 		"credentials variable unset": {"", nico, sitespec.NicoCredentialsEnv + " must name"},
 		"missing NICo token file":    {filepath.Join(dir, "absent"), nico, sitespec.NicoCredentialsEnv},
 		"empty NICo token file":      {empty, nico, "is empty"},
-		"client credentials refused": {structured, nico, "client-credentials form is not supported"},
 		"no NICo block in the spec":  {nicoToken, &sitespec.SiteSpec{Infra: sitespec.Infra{Provider: sitespec.ProviderNico}}, "infra.nico.remote"},
 	} {
 		t.Run(name, func(t *testing.T) {

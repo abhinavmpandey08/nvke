@@ -501,7 +501,7 @@ expect_refusal "a NICo token file that does not exist" "NVKECTL_NICO_CREDENTIALS
 expect_refusal "an empty NICo token file" "is empty" \
   env NVKECTL_NICO_CREDENTIALS="${SIM_STATE_DIR}/empty.token" "${NVKECTL}" bootstrap site --dry-run -f "${RENDERED_SITESPEC}"
 printf 'clientID: example\nclientSecret: example\n' >"${SIM_STATE_DIR}/client-credentials.token"
-expect_refusal "a client-credentials NICo token file" "client-credentials form is not supported" \
+expect_refusal "a client-credentials NICo token file without its tokenURL" "missing: tokenURL" \
   env NVKECTL_NICO_CREDENTIALS="${SIM_STATE_DIR}/client-credentials.token" "${NVKECTL}" bootstrap site --dry-run -f "${RENDERED_SITESPEC}"
 
 expect_refusal "no node login password" "NVKECTL_NODE_PASSWORD is not set" \

@@ -1506,9 +1506,10 @@ func nvkeImages(cfg controllerdeploy.Config) []string {
 
 // capnicoAccess resolves the site spec's infra.nico into the values the
 // bootstrap CAPNICo is given: the endpoint and organization from the spec, and
-// the token from the file NVKECTL_NICO_CREDENTIALS names. The file is read here,
-// before a Kind cluster exists, so an unreadable one fails at once rather than
-// minutes in. It returns the zero value for any provider but nico.
+// the token or OAuth2 client from the file NVKECTL_NICO_CREDENTIALS names. The
+// file is read here, before a Kind cluster exists, so an unreadable one fails at
+// once rather than minutes in. It returns the zero value for any provider but
+// nico.
 func capnicoAccess(inv *sitespec.SiteSpec) (controllerdeploy.CAPNICoAccess, error) {
 	if !inv.IsNico() {
 		return controllerdeploy.CAPNICoAccess{}, nil
@@ -1519,17 +1520,20 @@ func capnicoAccess(inv *sitespec.SiteSpec) (controllerdeploy.CAPNICoAccess, erro
 	}
 	path := sitespec.NicoCredentialsPath()
 	if path == "" {
-		return controllerdeploy.CAPNICoAccess{}, fmt.Errorf("%s must name the file holding the NICo token", sitespec.NicoCredentialsEnv)
+		return controllerdeploy.CAPNICoAccess{}, fmt.Errorf("%s must name the file holding the NICo token or client credentials", sitespec.NicoCredentialsEnv)
 	}
-	nicoToken, err := sitespec.ReadNicoToken(path)
+	creds, err := sitespec.ReadNicoCredentials(path)
 	if err != nil {
 		return controllerdeploy.CAPNICoAccess{}, fmt.Errorf("%s: %w", sitespec.NicoCredentialsEnv, err)
 	}
 	return controllerdeploy.CAPNICoAccess{
-		Endpoint: n.Remote.Endpoint,
-		OrgID:    n.OrgID,
-		APIName:  n.Remote.EffectiveAPIName(),
-		Token:    nicoToken,
+		Endpoint:     n.Remote.Endpoint,
+		OrgID:        n.OrgID,
+		APIName:      n.Remote.EffectiveAPIName(),
+		Token:        creds.Token,
+		TokenURL:     creds.TokenURL,
+		ClientID:     creds.ClientID,
+		ClientSecret: creds.ClientSecret,
 	}, nil
 }
 

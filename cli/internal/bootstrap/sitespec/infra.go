@@ -282,12 +282,18 @@ func (v *validator) checkNicoCredentials(inv *SiteSpec) {
 	}
 	path := NicoCredentialsPath()
 	if path == "" {
-		v.addf("%s must name the file holding the NICo token: the bootstrap CAPNICo needs it, and it is not in the site spec",
+		v.addf("%s must name the file holding the NICo token or client credentials: the bootstrap CAPNICo needs them, and they are not in the site spec",
 			NicoCredentialsEnv)
 		return
 	}
-	if _, err := ReadNicoToken(path); err != nil {
+	creds, err := ReadNicoCredentials(path)
+	if err != nil {
 		v.addf("%s: %v", NicoCredentialsEnv, err)
+		return
+	}
+	if u, err := url.Parse(creds.TokenURL); err == nil && u.Scheme == "http" && os.Getenv(NicoInsecureEndpointEnv) != "1" {
+		v.addf("%s: the tokenURL is http, so the client secret would be sent in cleartext; use https, or set %s=1 for a local or simulated NICo",
+			NicoCredentialsEnv, NicoInsecureEndpointEnv)
 	}
 }
 

@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strings"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/dsx-ai-factory/nvke/cli/internal/deploypath/stackconfig"
 	"github.com/dsx-ai-factory/nvke/cli/internal/envalias"
 )
@@ -20,9 +22,10 @@ const (
 	// the credentials never enter the site spec.
 	NicoCredentialsEnv = "NVKECTL_NICO_CREDENTIALS"
 
-	// NicoInsecureEndpointEnv, set to 1, lets infra.nico.remote.endpoint be an
-	// http URL. The bootstrap sends the NICo bearer token to that endpoint, so
-	// without it only https is accepted; it is for a local or simulated NICo.
+	// NicoInsecureEndpointEnv, set to 1, lets infra.nico.remote.endpoint and
+	// the credentials' tokenURL be http URLs. The bootstrap sends the NICo
+	// bearer token or client secret to them, so without it only https is
+	// accepted; it is for a local or simulated NICo.
 	NicoInsecureEndpointEnv = "NVKECTL_NICO_ALLOW_INSECURE_ENDPOINT"
 
 	// DefaultNicoAPIName is the API name in the NICo API path that CAPNICo is
@@ -39,35 +42,70 @@ func NicoCredentialsPath() string {
 	return envalias.Get(NicoCredentialsEnv)
 }
 
-// ReadNicoToken returns the NICo bearer token from the credentials file at
-// path. The format is told from the content: a file with tokenURL, clientID or
-// clientSecret is the client-credentials form, which is refused for now because
-// CAPNICo's credentials Secret takes only a bearer token; anything else is the
-// token itself, and must be one value with no whitespace inside it.
+// NicoCredentials is what the bootstrap reaches an existing NICo's REST API
+// with: a bearer Token, or an OAuth2 client (TokenURL, ClientID, ClientSecret).
+type NicoCredentials struct {
+	Token        string `yaml:"-"`
+	TokenURL     string `yaml:"tokenURL"`
+	ClientID     string `yaml:"clientID"`
+	ClientSecret string `yaml:"clientSecret"`
+}
+
+// ReadNicoCredentials reads the NICo credentials file at path. The format is
+// told from the content: a file with tokenURL, clientID or clientSecret is the
+// client-credentials form, a YAML or JSON map that must set all three, with
+// tokenURL an http or https URL; anything else is a bearer token, one value
+// with no whitespace inside it.
 //
 // The errors name neither path nor content: an operator who sets the variable
 // to the token itself, rather than to a file holding it, must not see the token
 // printed back.
-func ReadNicoToken(path string) (string, error) {
+func ReadNicoCredentials(path string) (NicoCredentials, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		var pathErr *fs.PathError
 		if errors.As(err, &pathErr) {
 			err = pathErr.Err
 		}
-		return "", errors.New("the file it names cannot be read (" + err.Error() + "); it must be the path of a file that holds the NICo token, not the token itself")
+		return NicoCredentials{}, errors.New("the file it names cannot be read (" + err.Error() +
+			"); it must be the path of a file that holds the NICo token or client credentials, not the token itself")
 	}
 	content := strings.TrimSpace(string(data))
 	switch {
 	case content == "":
-		return "", errors.New("the file it names is empty")
+		return NicoCredentials{}, errors.New("the file it names is empty")
 	case structuredCredentialKey.MatchString(content):
-		return "", errors.New("the file it names holds tokenURL, clientID or clientSecret: the client-credentials form is not supported yet, " +
-			"because the bootstrap CAPNICo's nico-credentials Secret takes only a bearer token; put the token in the file")
+		return readClientCredentials(content)
 	case strings.ContainsAny(content, " \t\r\n"):
-		return "", errors.New("the file it names must hold only the NICo token, one value with no whitespace in it")
+		return NicoCredentials{}, errors.New("the file it names must hold only the NICo token, one value with no whitespace in it")
 	}
-	return content, nil
+	return NicoCredentials{Token: content}, nil
+}
+
+// readClientCredentials decodes the client-credentials form. Its errors carry
+// no detail from the decoder, which would quote the content.
+func readClientCredentials(content string) (NicoCredentials, error) {
+	var creds NicoCredentials
+	dec := yaml.NewDecoder(strings.NewReader(content))
+	dec.KnownFields(true)
+	if err := dec.Decode(&creds); err != nil {
+		return NicoCredentials{}, errors.New("the file it names holds tokenURL, clientID or clientSecret, " +
+			"but is not a YAML or JSON map of exactly those three keys")
+	}
+	var missing []string
+	for _, f := range [][2]string{{"tokenURL", creds.TokenURL}, {"clientID", creds.ClientID}, {"clientSecret", creds.ClientSecret}} {
+		if f[1] == "" {
+			missing = append(missing, f[0])
+		}
+	}
+	if len(missing) > 0 {
+		return NicoCredentials{}, errors.New("the client credentials in the file it names need tokenURL, clientID and clientSecret; missing: " +
+			strings.Join(missing, ", "))
+	}
+	if !validHTTPEndpoint(creds.TokenURL) {
+		return NicoCredentials{}, errors.New("the tokenURL in the file it names must be an http or https URL")
+	}
+	return creds, nil
 }
 
 // NodeLoginFromEnv reads the login rendered into every node CAPNICo creates
