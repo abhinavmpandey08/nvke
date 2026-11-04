@@ -22,6 +22,7 @@ import (
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicoalloc"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicodeploy"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicoingest"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicomove"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitespec"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/untaint"
@@ -39,14 +40,16 @@ const nicoFetchTimeout = 10 * time.Minute
 
 // managedNico is the NICo infra.nico.managed has the bootstrap install: its
 // settings and secrets, loaded before anything is built, and what the install
-// on the bootstrap cluster leaves behind.
+// on the bootstrap cluster leaves for the move onto the site cluster.
 type managedNico struct {
 	settings *nicosettings.Settings
 	secrets  nicosettings.Secrets
 
-	// dir holds the NICo source release, root its extracted charts.
+	// dir holds the NICo source release, root its extracted charts. They are
+	// kept until the move, which installs the same charts on the site.
 	dir, root string
-	// inst is the NICo the bootstrap cluster's install installed.
+	// seed is the bootstrap cluster's install and inst the NICo it installed.
+	seed nicodeploy.Config
 	inst *nicodeploy.Installed
 }
 
@@ -130,8 +133,8 @@ func (n *managedNico) install(
 	if err != nil {
 		return err
 	}
-	seed := nicodeploy.NewConfig(n.settings, n.secrets, nicodeploy.ProfileSeed, bootstrapStorageClass)
-	if n.inst, err = nicodeploy.New(runner, kube, logger).Install(ctx, kubeconfig, n.root, seed); err != nil {
+	n.seed = nicodeploy.NewConfig(n.settings, n.secrets, nicodeploy.ProfileSeed, bootstrapStorageClass)
+	if n.inst, err = nicodeploy.New(runner, kube, logger).Install(ctx, kubeconfig, n.root, n.seed); err != nil {
 		return fmt.Errorf("installing NICo: %w", err)
 	}
 	cweCfg.CAPNICo = controllerdeploy.CAPNICoAccess{
@@ -233,6 +236,52 @@ func pointAtNico(inv *sitespec.SiteSpec, inst *nicodeploy.Installed, res *nicoal
 	return nil
 }
 
+// move moves NICo from the bootstrap cluster onto the site cluster and writes
+// its handover bundle. removeAddresses takes the service addresses off the
+// bootstrap host, once the site is ready to hold them.
+func (n *managedNico) move(
+	ctx context.Context,
+	seedKubeconfig, siteKubeconfig string,
+	runner controllerdeploy.CommandRunner,
+	hostRunner bootstrapengine.CommandRunner,
+	logger *slog.Logger,
+) error {
+	seedKube, err := untaint.NewClient(seedKubeconfig)
+	if err != nil {
+		return err
+	}
+	siteKube, err := untaint.NewClient(siteKubeconfig)
+	if err != nil {
+		return err
+	}
+	logger.Info("moving NICo onto the site cluster", "site", n.inst.SiteID)
+	_, err = nicomove.Run(ctx, nicomove.Config{
+		SeedKubeconfig: seedKubeconfig,
+		SiteKubeconfig: siteKubeconfig,
+		Root:           n.root,
+		Seed:           n.seed,
+		Site:           nicodeploy.NewConfig(n.settings, n.secrets, nicodeploy.ProfileSite, bootstrapStorageClass),
+		SiteID:         n.inst.SiteID,
+		Runner:         runner,
+		SeedKube:       seedKube,
+		SiteKube:       siteKube,
+		RemoveHostAddresses: func(ctx context.Context) error {
+			return removeHostAddresses(ctx, hostRunner, n.addresses(), logger)
+		},
+		Logger: logger,
+	})
+	return err
+}
+
+// nicoMoveFailedError wraps err, from moving NICo onto the site cluster. The
+// bootstrap cluster may still hold NICo's only databases and Vault, so the
+// advice is to keep it. The move may also have left CAPNICo on the site stopped.
+func nicoMoveFailedError(err error, cluster *bootstrapengine.Cluster) error {
+	return &recoveryError{fmt.Errorf("moving NICo onto the site cluster: %w; bootstrap cluster %q may hold NICo's only copy of "+
+		"its databases and Vault, so it was retained and is not to be deleted (kubeconfig: %s); CAPNICo on the site cluster "+
+		"(capnico-system/controller-manager) may be left scaled to 0", err, cluster.Name, cluster.KubeconfigPath)}
+}
+
 // hostAddress is one address on the bootstrap host: the interface it is on
 // and the prefix it was added with.
 type hostAddress struct {
@@ -292,6 +341,31 @@ func ensureHostAddresses(ctx context.Context, runner bootstrapengine.CommandRunn
 			return fmt.Errorf("adding NICo service address %s to the bootstrap host: %w: %s%s", s, err, strings.TrimSpace(out), hint)
 		}
 		logger.Info("added a NICo service address to the bootstrap host", "address", s, "dev", hostLoopback)
+	}
+	return nil
+}
+
+// removeHostAddresses takes each address in addrs off the bootstrap host's
+// loopback interface, whoever put it there: the site cluster announces the
+// addresses next, and an address left on the host would answer for them too.
+func removeHostAddresses(ctx context.Context, runner bootstrapengine.CommandRunner, addrs []string, logger *slog.Logger) error {
+	have, err := listHostAddresses(ctx, runner)
+	if err != nil {
+		return err
+	}
+	for _, s := range addrs {
+		ip, err := netip.ParseAddr(s)
+		if err != nil {
+			return fmt.Errorf("NICo service address %q: %w", s, err)
+		}
+		a, ok := have[ip]
+		if !ok || a.dev != hostLoopback {
+			continue
+		}
+		if out, err := runner.Run(ctx, nil, "ip", "addr", "del", a.prefix, "dev", hostLoopback); err != nil {
+			return fmt.Errorf("removing NICo service address %s from the bootstrap host: %w: %s", s, err, strings.TrimSpace(out))
+		}
+		logger.Info("removed a NICo service address from the bootstrap host", "address", s)
 	}
 	return nil
 }

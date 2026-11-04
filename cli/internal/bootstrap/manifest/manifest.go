@@ -31,6 +31,8 @@ const (
 	ComponentVault            = "vault"
 	ComponentExternalSecrets  = "external-secrets"
 	ComponentCertManager      = "cert-manager"
+	// ComponentMetalLB publishes NICo's services on the site cluster.
+	ComponentMetalLB = "metallb"
 
 	// Image keys under the two components this repository builds.
 	ImageController = "controller"

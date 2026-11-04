@@ -352,10 +352,6 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	if err != nil {
 		return fmt.Errorf("site spec file %s: %w", opts.siteSpec, err)
 	}
-	// NICo cannot leave the bootstrap cluster yet, so the bootstrap cluster is kept.
-	if nico != nil {
-		opts.keepBootstrapKind = true
-	}
 	// Resolved here too, so a bad --release or --arch fails the dry run.
 	capnicoImage, err := capnicoReleaseImage(inv, opts.release, opts.arch)
 	if err != nil {
@@ -689,9 +685,13 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 			return pivotFailedError(err, cluster)
 		}
 	}
+	// Before the bootstrap cluster goes, NICo moves off it onto the site cluster.
 	if nico != nil {
-		fmt.Fprintf(out, "\nNICo still runs in bootstrap cluster %q, which the site cluster's CAPNICo needs: keep it (kubeconfig: %s).\n",
-			cluster.Name, cluster.KubeconfigPath)
+		if err := nico.move(ctx, cluster.KubeconfigPath, kubeconfigPath, opts.cweRunner, engine.Runner, logger); err != nil {
+			return nicoMoveFailedError(err, cluster)
+		}
+		fmt.Fprintf(out, "\nNICo runs on cluster %q. Its handover bundle, with NICo's Vault keys, is in %s: move it off this host.\n",
+			inv.ClusterName, nico.settings.HandoverDir)
 	}
 
 	// Nico mode does not list the allocated nodes here; kubectl get nodes shows them.

@@ -98,6 +98,16 @@ func TestEnsureHostAddresses(t *testing.T) {
 	}
 }
 
+// TestRemoveHostAddresses: only addresses on lo are removed, with the prefix
+// they are listed with.
+func TestRemoveHostAddresses(t *testing.T) {
+	runner := &ipRunner{addrs: ipAddrShow + "1: lo    inet 192.0.2.12/24 scope global lo\\ \n"}
+	err := removeHostAddresses(context.Background(), runner, []string{"192.0.2.10", "192.0.2.11", "192.0.2.12", "10.0.0.5"},
+		slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ip addr del 192.0.2.10/32 dev lo", "ip addr del 192.0.2.12/24 dev lo"}, runner.calls)
+}
+
 // TestPointAtNico: the IDs of the NICo the bootstrap installed reach the
 // create request, with the subnet or the VPC prefix the VPC type made.
 func TestPointAtNico(t *testing.T) {
