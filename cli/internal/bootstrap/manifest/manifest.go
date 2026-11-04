@@ -24,6 +24,14 @@ const (
 	ComponentProvisioned = "cluster-api-provider-provisioned"
 	ComponentCAPNICo     = "cluster-api-provider-nico"
 
+	// The NICo the bootstrap installs for infra.nico.managed, and the upstream
+	// charts its install pulls.
+	ComponentNico             = "nico"
+	ComponentPostgresOperator = "postgres-operator"
+	ComponentVault            = "vault"
+	ComponentExternalSecrets  = "external-secrets"
+	ComponentCertManager      = "cert-manager"
+
 	// Image keys under the two components this repository builds.
 	ImageController = "controller"
 	ImageManager    = "manager"
@@ -47,6 +55,16 @@ type Manifest struct {
 type Component struct {
 	Chart  *Chart           `yaml:"chart,omitempty"`
 	Images map[string]Image `yaml:"images,omitempty"`
+	// Source is a source archive the component's charts are taken from, for a
+	// component that publishes none.
+	Source *Source `yaml:"source,omitempty"`
+}
+
+// Source is a source archive, which the bootstrap checks against SHA256
+// before it uses it.
+type Source struct {
+	URL    string `yaml:"url"`
+	SHA256 string `yaml:"sha256"`
 }
 
 // Chart names a Helm chart by repository, name and version.

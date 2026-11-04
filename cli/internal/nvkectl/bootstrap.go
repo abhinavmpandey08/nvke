@@ -33,6 +33,7 @@ import (
 	// Aliased: this file has a local variable named engine.
 	bootstrapengine "github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/engine"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/etcdkey"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicodeploy"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nvkrrelease"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/pivot"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitecluster"
@@ -346,6 +347,15 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	if err := errors.Join(inv.CheckBootstrapMode(opts.disableMTLS), inv.ValidateBootstrapReferences()); err != nil {
 		return fmt.Errorf("site spec file %s: %w", opts.siteSpec, err)
 	}
+	// The validation above has read them too; these are the values the run uses.
+	nico, err := loadManagedNico(inv)
+	if err != nil {
+		return fmt.Errorf("site spec file %s: %w", opts.siteSpec, err)
+	}
+	// NICo cannot leave the bootstrap cluster yet, so the bootstrap cluster is kept.
+	if nico != nil {
+		opts.keepBootstrapKind = true
+	}
 	// Resolved here too, so a bad --release or --arch fails the dry run.
 	capnicoImage, err := capnicoReleaseImage(inv, opts.release, opts.arch)
 	if err != nil {
@@ -413,6 +423,10 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	// own address, because that address is not routable from the host on
 	// every platform this runs on.
 	cfg.ExtraPortMappings = append(cfg.ExtraPortMappings, bootstrapPortMappings(cweCfg)...)
+	// A NICo the bootstrap installs is published on its service addresses on this host.
+	if nico != nil {
+		cfg.ExtraPortMappings = append(cfg.ExtraPortMappings, nicodeploy.SeedPortMappings(nico.settings.Addresses)...)
+	}
 
 	engine := bootstrapengine.New(opts.bootstrapRunner, logger)
 
@@ -487,6 +501,13 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	}
 
 	ctx = phases.enter(phaseBootstrapCluster, nil)
+	// Kind binds each NICo port mapping to its address, which must exist first,
+	// and a resumed run's host may have lost it.
+	if nico != nil {
+		if err := ensureHostAddresses(ctx, engine.Runner, nico.addresses(), logger); err != nil {
+			return err
+		}
+	}
 	var cluster *bootstrapengine.Cluster
 	if adopt {
 		logger.Info("resuming with the bootstrap kind cluster an earlier run left", "bootstrap_kind_cluster", cfg.ClusterName)
@@ -596,6 +617,17 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 			fmt.Fprintf(out, "\nCluster %q is ready. Talk to it with:\n  kubectl --kubeconfig %s get nodes\n", inv.ClusterName, kubeconfigPath)
 			return nil
 		}
+	}
+
+	// A NICo the bootstrap installs runs in the bootstrap cluster until the site
+	// cluster can take it over. It needs nothing of the NVKE stack, so it goes first.
+	if nico != nil {
+		defer nico.removeSource()
+		if err := nico.install(ctx, cluster.KubeconfigPath, opts.cweRunner, logger); err != nil {
+			return fmt.Errorf("setting up NICo in the bootstrap cluster: %w", err)
+		}
+		return fmt.Errorf("NICo is installed in bootstrap cluster %q (kubeconfig: %s); the bootstrap does not yet configure it "+
+			"for the site cluster, so it stops here", cluster.Name, cluster.KubeconfigPath)
 	}
 
 	// Step 3: deploy Postgres, Temporal, SPIRE, Cluster API, and the controller onto the bootstrap
@@ -1509,9 +1541,10 @@ func nvkeImages(cfg controllerdeploy.Config) []string {
 // the token or OAuth2 client from the file NVKECTL_NICO_CREDENTIALS names. The
 // file is read here, before a Kind cluster exists, so an unreadable one fails at
 // once rather than minutes in. It returns the zero value for any provider but
-// nico.
+// nico, and for a NICo the bootstrap installs, whose credentials exist only
+// once it is installed.
 func capnicoAccess(inv *sitespec.SiteSpec) (controllerdeploy.CAPNICoAccess, error) {
-	if !inv.IsNico() {
+	if !inv.IsNico() || inv.IsManagedNico() {
 		return controllerdeploy.CAPNICoAccess{}, nil
 	}
 	n := inv.Infra.Nico

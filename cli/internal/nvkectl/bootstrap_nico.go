@@ -1,0 +1,191 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package nvkectl
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/netip"
+	"os"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/controllerdeploy"
+	bootstrapengine "github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/engine"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/manifest"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicodeploy"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitespec"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/untaint"
+	"github.com/dsx-ai-factory/nvke/cli/internal/redact"
+)
+
+// bootstrapStorageClass is the StorageClass Kind gives every cluster it creates.
+const bootstrapStorageClass = "standard"
+
+// hostLoopback is the bootstrap host's interface the service addresses are put on.
+const hostLoopback = "lo"
+
+// nicoFetchTimeout bounds the download of the NICo source release.
+const nicoFetchTimeout = 10 * time.Minute
+
+// managedNico is the NICo infra.nico.managed has the bootstrap install: its
+// settings and secrets, loaded before anything is built, and what the install
+// on the bootstrap cluster leaves behind.
+type managedNico struct {
+	settings *nicosettings.Settings
+	secrets  nicosettings.Secrets
+
+	// dir holds the NICo source release, root its extracted charts.
+	dir, root string
+	// inst is the NICo the bootstrap cluster's install installed.
+	inst *nicodeploy.Installed
+}
+
+// loadManagedNico loads the NICo settings infra.nico.managed names and the
+// secrets they need from the environment. It returns nil without a managed
+// NICo. Every secret it reads is registered for redaction, so none reaches a
+// log or an error printed later.
+func loadManagedNico(inv *sitespec.SiteSpec) (*managedNico, error) {
+	if !inv.IsManagedNico() {
+		return nil, nil
+	}
+	path := inv.NicoSettingsPath()
+	settings, err := nicosettings.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("NICo settings %s: %w", path, err)
+	}
+	secrets, err := nicosettings.SecretsFromEnv(settings)
+	if err != nil {
+		return nil, fmt.Errorf("NICo settings %s: %w", path, err)
+	}
+	for _, s := range []string{
+		secrets.SiteWideBMCRootPassword, secrets.HostUEFIPassword, secrets.DPUUEFIPassword,
+		secrets.DPUBMCFactoryPassword, secrets.RegistryPassword, secrets.ClientSecret,
+	} {
+		redact.RegisterSecret(s)
+	}
+	for _, login := range secrets.BMCLogins {
+		redact.RegisterSecret(login.Password)
+	}
+	if have, want := len(settings.MachineList), inv.ControlPlaneCount(); have < want {
+		return nil, fmt.Errorf("NICo settings %s: the machines file lists %d machines, fewer than the %d infra.nico.controlPlane.count asks for",
+			path, have, want)
+	}
+	// Vault's chart runs one replica per node, and the site cluster's nodes are its control plane.
+	if replicas, nodes := settings.EffectiveSiteReplicas(), inv.ControlPlaneCount(); replicas > nodes {
+		return nil, fmt.Errorf("NICo settings %s: site.replicas is %d, more than the site cluster's %d nodes (infra.nico.controlPlane.count); "+
+			"set site.replicas to at most %d", path, replicas, nodes, nodes)
+	}
+	return &managedNico{settings: settings, secrets: secrets}, nil
+}
+
+// addresses returns the service addresses published on the bootstrap host, in
+// the order SeedPortMappings lists them.
+func (n *managedNico) addresses() []string {
+	var addrs []string
+	for _, m := range nicodeploy.SeedPortMappings(n.settings.Addresses) {
+		if !slices.Contains(addrs, m.ListenAddress) {
+			addrs = append(addrs, m.ListenAddress)
+		}
+	}
+	return addrs
+}
+
+// removeSource deletes the NICo source release.
+func (n *managedNico) removeSource() {
+	if n.dir != "" {
+		_ = os.RemoveAll(n.dir)
+	}
+}
+
+// install installs NICo in the bootstrap cluster from the release the
+// bootstrap manifest pins.
+func (n *managedNico) install(ctx context.Context, kubeconfig string, runner controllerdeploy.CommandRunner, logger *slog.Logger) error {
+	dir, err := os.MkdirTemp("", "nvkectl-nico-source-")
+	if err != nil {
+		return err
+	}
+	n.dir = dir
+	client := &http.Client{Timeout: nicoFetchTimeout}
+	if n.root, err = nicodeploy.Fetch(ctx, client, *manifest.Load().Components[manifest.ComponentNico].Source, dir); err != nil {
+		return err
+	}
+	kube, err := untaint.NewClient(kubeconfig)
+	if err != nil {
+		return err
+	}
+	seed := nicodeploy.NewConfig(n.settings, n.secrets, nicodeploy.ProfileSeed, bootstrapStorageClass)
+	if n.inst, err = nicodeploy.New(runner, kube, logger).Install(ctx, kubeconfig, n.root, seed); err != nil {
+		return fmt.Errorf("installing NICo: %w", err)
+	}
+	logger.Info("NICo is ready in the bootstrap cluster", "site", n.inst.SiteID, "endpoint", n.inst.RESTEndpoint)
+	return nil
+}
+
+// hostAddress is one address on the bootstrap host: the interface it is on
+// and the prefix it was added with.
+type hostAddress struct {
+	dev    string
+	prefix string
+}
+
+// listHostAddresses returns the bootstrap host's addresses, from `ip -o addr show`.
+func listHostAddresses(ctx context.Context, runner bootstrapengine.CommandRunner) (map[netip.Addr]hostAddress, error) {
+	out, err := runner.Run(ctx, nil, "ip", "-o", "addr", "show")
+	if err != nil {
+		return nil, fmt.Errorf("listing the bootstrap host's addresses with `ip -o addr show`: %w: %s", err, strings.TrimSpace(out))
+	}
+	have := map[netip.Addr]hostAddress{}
+	// Each line is "<index>: <dev> inet|inet6 <address>/<length> ...".
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || (f[2] != "inet" && f[2] != "inet6") {
+			continue
+		}
+		if p, err := netip.ParsePrefix(f[3]); err == nil {
+			have[p.Addr()] = hostAddress{dev: f[1], prefix: f[3]}
+		}
+	}
+	return have, nil
+}
+
+// ensureHostAddresses puts each address in addrs on the bootstrap host's
+// loopback interface, unless it is there already, so Kind can publish NICo's
+// services on it. An address on any other interface is refused: the move takes
+// the addresses off this host and onto the site cluster, and only removes them
+// from the loopback interface.
+func ensureHostAddresses(ctx context.Context, runner bootstrapengine.CommandRunner, addrs []string, logger *slog.Logger) error {
+	have, err := listHostAddresses(ctx, runner)
+	if err != nil {
+		return err
+	}
+	for _, s := range addrs {
+		ip, err := netip.ParseAddr(s)
+		if err != nil {
+			return fmt.Errorf("NICo service address %q: %w", s, err)
+		}
+		if a, ok := have[ip]; ok {
+			if a.dev != hostLoopback {
+				return fmt.Errorf("NICo service address %s is on interface %s of the bootstrap host; the bootstrap puts the service "+
+					"addresses on %s and moves them to the site cluster at the end, so remove it from %s and re-run", s, a.dev, hostLoopback, a.dev)
+			}
+			continue
+		}
+		prefix := netip.PrefixFrom(ip, ip.BitLen()).String()
+		if out, err := runner.Run(ctx, nil, "ip", "addr", "add", prefix, "dev", hostLoopback); err != nil {
+			hint := ""
+			if strings.Contains(out, "not permitted") {
+				hint = "; adding an address needs root or CAP_NET_ADMIN: run nvkectl as root, or add it yourself with `ip addr add " +
+					prefix + " dev " + hostLoopback + "`"
+			}
+			return fmt.Errorf("adding NICo service address %s to the bootstrap host: %w: %s%s", s, err, strings.TrimSpace(out), hint)
+		}
+		logger.Info("added a NICo service address to the bootstrap host", "address", s, "dev", hostLoopback)
+	}
+	return nil
+}

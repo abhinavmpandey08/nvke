@@ -1,0 +1,173 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package nvkectl
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitespec"
+	"github.com/dsx-ai-factory/nvke/cli/internal/redact"
+)
+
+// ipRunner answers `ip -o addr show` with addrs, refuses changes with refuse
+// when it is set, and records every other ip command.
+type ipRunner struct {
+	addrs  string
+	refuse string
+	calls  []string
+}
+
+func (r *ipRunner) Run(_ context.Context, _ map[string]string, name string, args ...string) (string, error) {
+	cmd := strings.Join(append([]string{name}, args...), " ")
+	if cmd == "ip -o addr show" {
+		return r.addrs, nil
+	}
+	r.calls = append(r.calls, cmd)
+	if r.refuse != "" {
+		return r.refuse, errors.New("exit status 2")
+	}
+	return "", nil
+}
+
+const ipAddrShow = `1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+1: lo    inet 192.0.2.10/32 scope global lo\       valid_lft forever preferred_lft forever
+1: lo    inet6 ::1/128 scope host noprefixroute \       valid_lft forever preferred_lft forever
+2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\       valid_lft forever preferred_lft forever
+`
+
+// TestEnsureHostAddresses: a service address missing from the bootstrap host is
+// put on lo as a host route; one already on lo is left alone; one on another
+// interface, which the move could not take off, is refused.
+func TestEnsureHostAddresses(t *testing.T) {
+	for name, tt := range map[string]struct {
+		addrs     []string
+		refuse    string
+		wantCalls []string
+		wantErr   []string
+	}{
+		"missing IPv4 address added": {
+			addrs:     []string{"192.0.2.10", "192.0.2.11"},
+			wantCalls: []string{"ip addr add 192.0.2.11/32 dev lo"},
+		},
+		"missing IPv6 address added": {
+			addrs:     []string{"2001:db8::13"},
+			wantCalls: []string{"ip addr add 2001:db8::13/128 dev lo"},
+		},
+		"address already on lo": {addrs: []string{"192.0.2.10"}},
+		"address on another interface": {
+			addrs:   []string{"10.0.0.5"},
+			wantErr: []string{"10.0.0.5 is on interface eth0", "remove it from eth0"},
+		},
+		"refused without privileges": {
+			addrs:     []string{"192.0.2.11"},
+			refuse:    "RTNETLINK answers: Operation not permitted\n",
+			wantCalls: []string{"ip addr add 192.0.2.11/32 dev lo"},
+			wantErr:   []string{"192.0.2.11", "Operation not permitted", "root or CAP_NET_ADMIN"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			runner := &ipRunner{addrs: ipAddrShow, refuse: tt.refuse}
+			err := ensureHostAddresses(context.Background(), runner, tt.addrs, slog.New(slog.DiscardHandler))
+			assert.Equal(t, tt.wantCalls, runner.calls)
+			if len(tt.wantErr) == 0 {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			for _, want := range tt.wantErr {
+				assert.Contains(t, err.Error(), want)
+			}
+		})
+	}
+}
+
+// managedNicoSiteSpec writes the nico example as a managed NICo whose settings
+// are the nicosettings test fixture, with count control-plane machines and
+// every secret the settings need set.
+func managedNicoSiteSpec(t *testing.T, count int) string {
+	t.Helper()
+	path := nicoSiteSpecFile(t)
+	dir := filepath.Dir(path)
+	for _, name := range []string{"settings.yaml", "machines.yaml", "nico-core.yaml", "id.pub"} {
+		data, err := os.ReadFile(filepath.Join("../bootstrap/nicosettings/testdata", name))
+		require.NoError(t, err)
+		if name == "settings.yaml" {
+			// The site cluster's nodes are its control plane, each running one Vault replica.
+			data = []byte(strings.Replace(string(data), "  storageClass: example-storage\n",
+				"  storageClass: example-storage\n  replicas: "+strconv.Itoa(count)+"\n", 1))
+		}
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), data, 0o600))
+	}
+	example, err := os.ReadFile(path)
+	require.NoError(t, err)
+	text := string(example)
+	remote := "    remote:\n      endpoint: \"https://nico.example\"\n      siteID: \"00000000-0000-0000-0000-000000000001\"\n" +
+		"      vpcID: \"00000000-0000-0000-0000-000000000002\"\n"
+	require.Contains(t, text, remote, "the example's remote block changed; update this test")
+	text = strings.Replace(text, remote, "    managed:\n      settings: settings.yaml\n", 1)
+	require.Contains(t, text, "      count: 3\n", "the example's control-plane count changed; update this test")
+	text = strings.Replace(text, "      count: 3\n", "      count: "+strconv.Itoa(count)+"\n", 1)
+	require.NoError(t, os.WriteFile(path, []byte(text), 0o600))
+
+	t.Setenv(sitespec.NicoCredentialsEnv, "")
+	t.Setenv(sitespec.NicoInsecureEndpointEnv, "1")
+	t.Setenv(nicosettings.SiteWideBMCRootPasswordEnv, "example-root-password")
+	t.Setenv(nicosettings.HostUEFIPasswordEnv, "example-host-uefi")
+	t.Setenv(nicosettings.DPUUEFIPasswordEnv, "example-dpu-uefi")
+	t.Setenv("NICO_BMC_EXAMPLE_USERNAME", "example-user")
+	t.Setenv("NICO_BMC_EXAMPLE_PASSWORD", "example-bmc-password")
+	return path
+}
+
+// TestRunBootstrapSiteDryRunLoadsManagedNico: the dry run loads the NICo
+// settings and their secrets, and refuses a control plane larger than the
+// machines file and more Vault replicas than the control plane has nodes.
+func TestRunBootstrapSiteDryRunLoadsManagedNico(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		err := runBootstrapSite(context.Background(), io.Discard, &bootstrapSiteOptions{siteSpec: managedNicoSiteSpec(t, 1), dryRun: true})
+		require.NoError(t, err)
+		assert.NotEqual(t, "example-bmc-password", redact.Text("example-bmc-password"), "a BMC password is redacted")
+	})
+	t.Run("more control-plane machines than the machines file lists", func(t *testing.T) {
+		err := runBootstrapSite(context.Background(), io.Discard, &bootstrapSiteOptions{siteSpec: managedNicoSiteSpec(t, 3), dryRun: true})
+		require.ErrorContains(t, err, "lists 2 machines, fewer than the 3")
+	})
+	t.Run("more Vault replicas than the site cluster has nodes", func(t *testing.T) {
+		path := managedNicoSiteSpec(t, 1)
+		settings := filepath.Join(filepath.Dir(path), "settings.yaml")
+		data, err := os.ReadFile(settings)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(settings, []byte(strings.Replace(string(data), "  replicas: 1\n", "  replicas: 3\n", 1)), 0o600))
+		err = runBootstrapSite(context.Background(), io.Discard, &bootstrapSiteOptions{siteSpec: path, dryRun: true})
+		require.ErrorContains(t, err, "site.replicas is 3, more than the site cluster's 1 nodes")
+	})
+	t.Run("a secret missing", func(t *testing.T) {
+		path := managedNicoSiteSpec(t, 1)
+		t.Setenv(nicosettings.HostUEFIPasswordEnv, "")
+		err := runBootstrapSite(context.Background(), io.Discard, &bootstrapSiteOptions{siteSpec: path, dryRun: true})
+		require.ErrorContains(t, err, nicosettings.HostUEFIPasswordEnv)
+	})
+}
+
+// TestManagedNicoAddresses: the addresses put on the bootstrap host are those
+// the seed's port mappings listen on, each once.
+func TestManagedNicoAddresses(t *testing.T) {
+	n := &managedNico{settings: &nicosettings.Settings{File: nicosettings.File{Addresses: nicosettings.Addresses{
+		DHCP: "192.0.2.10", PXE: "192.0.2.11", API: "192.0.2.12", REST: "192.0.2.13", Keycloak: "192.0.2.14",
+		NTP: []string{"192.0.2.16", "192.0.2.17"}, SSHConsole: "192.0.2.19",
+	}}}}
+	assert.ElementsMatch(t, []string{"192.0.2.10", "192.0.2.11", "192.0.2.12", "192.0.2.13", "192.0.2.14", "192.0.2.16", "192.0.2.17"}, n.addresses())
+}

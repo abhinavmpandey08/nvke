@@ -18,7 +18,8 @@
 # - The controller chart, the Postgres chart, the provisioned provider's
 #   manifest and the CAPNICo manifest. They ship inside nvkectl.
 # - The components `clusterctl init` installs: Cluster API core, the kubeadm
-#   providers and cert-manager.
+#   providers and cert-manager. With infra.nico.managed, cert-manager is
+#   listed below: the bootstrap installs it first, and clusterctl keeps it.
 # - The kindest/node image kind boots.
 #
 # This file is hand-authored. A later check compares it to what the charts
@@ -125,3 +126,41 @@ components:
       controller:
         ref: ghcr.io/dsx-ai-factory/cluster-api-provider-nico/controller:v0.1.0
         digest: sha256:4b6db5ce0b7f9e29f9c5257c4dc4831d23d6ff130790580d820dffb08b26d24c
+
+  # Installed only with infra.nico.managed. NICo publishes no charts, so they
+  # come from the release's source archive, which the bootstrap checks against
+  # the sha256 below. NICo's own images come from a registry you supply.
+  nico:
+    source:
+      url: https://github.com/NVIDIA/infra-controller/archive/refs/tags/v2.2.2.tar.gz
+      sha256: bc966ae60121f5cdf91647e28713f2d3f844cebd6f7891ce5ae8616b2a395ee5
+
+  # Upstream releases, at the versions NICo v2.2.2's helmfile pins. Installed
+  # only with infra.nico.managed.
+  postgres-operator:
+    chart:
+      repo: https://opensource.zalando.com/postgres-operator/charts/postgres-operator
+      name: postgres-operator
+      version: "1.11.0"
+      sha256: 3914b5e117bda0834f05c9207f007e2ac372864cf6e86dcc2e1362bbe46c14d9
+  vault:
+    chart:
+      repo: https://helm.releases.hashicorp.com
+      name: vault
+      version: "0.25.0"
+      sha256: 7d971d699487cb3dfcb8c5de669f0a123b7f7e5e97d20fc5ec04584fe29fc3e4
+  external-secrets:
+    chart:
+      repo: https://charts.external-secrets.io
+      name: external-secrets
+      version: "0.14.3"
+      sha256: 5e2c5bf1fdb7e875289fc36abe8064ceb1b1aa7021b3cf06007e8bd2b0b5754b
+  # Installed only with infra.nico.managed, before NICo, which needs it. The
+  # version `clusterctl init` installs, CERT_MANAGER_VERSION in
+  # make/tool-versions.mk: keep the two in step.
+  cert-manager:
+    chart:
+      repo: https://charts.jetstack.io
+      name: cert-manager
+      version: "v1.21.1"
+      sha256: c27101f3f3e2349fb4a9e704316105bf7b52ad73b8c8257d3498ef7f2f6a4adc

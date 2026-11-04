@@ -111,7 +111,8 @@ CLUSTERCTL_SHA256_AMD64 ?= 1e4019b8ef30fa13993716d28b9fec4072fee1e17ea2cc69cb7c8
 CLUSTERCTL_SHA256_ARM64 ?= c3fe61fd44fa63d2efcee2a93432619527909b210a84cda7ee86eea1425de8c2
 # The cert-manager `clusterctl init` installs at CAPI_VERSION. The NKTP chart's
 # Kind e2e installs it, and its kubeconform check validates against its CRDs.
-# Move it with CAPI_VERSION.
+# Move it with CAPI_VERSION, and with cert-manager in
+# cli/internal/bootstrap/manifest/bootstrap-manifest.yaml.
 CERT_MANAGER_VERSION ?= v1.21.1
 # Rancher's local-path-provisioner, the lab StorageClass of the local site
 # (deploy/nvke-deploy-local.sh); a real site brings its own CSI driver.
