@@ -14,10 +14,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicoalloc"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicodeploy"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitecluster"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitespec"
 	"github.com/dsx-ai-factory/nvke/cli/internal/redact"
 )
@@ -92,6 +96,62 @@ func TestEnsureHostAddresses(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPointAtNico: the IDs of the NICo the bootstrap installed reach the
+// create request, with the subnet or the VPC prefix the VPC type made.
+func TestPointAtNico(t *testing.T) {
+	ids := map[string]string{}
+	for _, name := range []string{"site", "vpc", "type", "group", "net"} {
+		ids[name] = uuid.NewString()
+	}
+	inst := &nicodeploy.Installed{SiteID: ids["site"], RESTEndpoint: "http://192.0.2.13:8388", OrgID: "ncx", APIName: "nico"}
+	for name, tt := range map[string]struct {
+		res        nicoalloc.Result
+		wantSubnet bool
+	}{
+		"ethernet virtualizer": {
+			res:        nicoalloc.Result{InstanceTypeID: ids["type"], VPCID: ids["vpc"], SubnetID: ids["net"], SSHKeyGroupID: ids["group"]},
+			wantSubnet: true,
+		},
+		"FNN": {
+			res: nicoalloc.Result{InstanceTypeID: ids["type"], VPCID: ids["vpc"], VPCPrefixID: ids["net"], SSHKeyGroupID: ids["group"]},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			inv := &sitespec.SiteSpec{ClusterName: "site-a", Infra: sitespec.Infra{Provider: sitespec.ProviderNico, Nico: &sitespec.NicoInfra{
+				Managed:      &sitespec.NicoManaged{Settings: "nico.yaml"},
+				ControlPlane: sitespec.NicoControlPlane{Count: 1},
+			}}}
+			inv.Infra.Nico.ControlPlane.Release = "r"
+			require.NoError(t, pointAtNico(inv, inst, &tt.res))
+
+			req, err := sitecluster.ClusterRequest(inv)
+			require.NoError(t, err)
+			require.NotNil(t, req.Nico)
+			assert.Equal(t, "ncx", req.Nico.OrgID)
+			assert.Equal(t, ids["site"], req.Nico.SiteID.String())
+			assert.Equal(t, ids["vpc"], req.Nico.VpcID.String())
+			cp := req.ControlPlaneConfig.Nico
+			assert.Equal(t, []uuid.UUID{uuid.MustParse(ids["type"])}, cp.InstanceTypePreference)
+			assert.Equal(t, []uuid.UUID{uuid.MustParse(ids["group"])}, cp.SSHKeyGroupIDs)
+			network := []uuid.UUID{uuid.MustParse(ids["net"])}
+			if tt.wantSubnet {
+				assert.Equal(t, network, cp.SubnetIDs)
+				assert.Empty(t, cp.VpcPrefixIDs)
+			} else {
+				assert.Equal(t, network, cp.VpcPrefixIDs)
+				assert.Empty(t, cp.SubnetIDs)
+			}
+			assert.Equal(t, "nico", inv.Infra.Nico.Remote.APIName)
+		})
+	}
+	t.Run("an ID that is not a UUID", func(t *testing.T) {
+		inv := &sitespec.SiteSpec{Infra: sitespec.Infra{Provider: sitespec.ProviderNico, Nico: &sitespec.NicoInfra{}}}
+		err := pointAtNico(inv, inst, &nicoalloc.Result{InstanceTypeID: "it-1", VPCID: ids["vpc"], SubnetID: ids["net"], SSHKeyGroupID: ids["group"]})
+		require.ErrorContains(t, err, `instance type ID "it-1"`)
+		assert.Nil(t, inv.Infra.Nico.Remote, "the site spec is left as it was")
+	})
 }
 
 // managedNicoSiteSpec writes the nico example as a managed NICo whose settings

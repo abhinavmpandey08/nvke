@@ -620,14 +620,13 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	}
 
 	// A NICo the bootstrap installs runs in the bootstrap cluster until the site
-	// cluster can take it over. It needs nothing of the NVKE stack, so it goes first.
+	// cluster can take it over. It needs nothing of the NVKE stack, so it goes
+	// first, and the stack's CAPNICo is given its credentials.
 	if nico != nil {
 		defer nico.removeSource()
-		if err := nico.install(ctx, cluster.KubeconfigPath, opts.cweRunner, logger); err != nil {
+		if err := nico.install(ctx, cluster.KubeconfigPath, &cweCfg, opts.cweRunner, logger); err != nil {
 			return fmt.Errorf("setting up NICo in the bootstrap cluster: %w", err)
 		}
-		return fmt.Errorf("NICo is installed in bootstrap cluster %q (kubeconfig: %s); the bootstrap does not yet configure it "+
-			"for the site cluster, so it stops here", cluster.Name, cluster.KubeconfigPath)
 	}
 
 	// Step 3: deploy Postgres, Temporal, SPIRE, Cluster API, and the controller onto the bootstrap
@@ -636,6 +635,13 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	ctx = phases.enter(phaseEngineDeploy, nil)
 	if err := deployAndWaitForCWE(ctx, engine, cluster, cweCfg, opts.cweRunner, logger); err != nil {
 		return err
+	}
+	// After the stack, so a stack that fails to install has not cost hours of
+	// ingest and left the machines changed by a NICo about to be deleted.
+	if nico != nil {
+		if err := nico.configure(ctx, inv, cluster.KubeconfigPath, opts.cweRunner, logger); err != nil {
+			return fmt.Errorf("configuring NICo for the site cluster: %w", err)
+		}
 	}
 
 	// Step 4: create the cluster. The controller owns everything from here — it drives
@@ -682,6 +688,10 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 		if err := pivotToSite(ctx, inv, cluster.KubeconfigPath, kubeconfigPath, cweCfg, controller, siteClusterID, logger); err != nil {
 			return pivotFailedError(err, cluster)
 		}
+	}
+	if nico != nil {
+		fmt.Fprintf(out, "\nNICo still runs in bootstrap cluster %q, which the site cluster's CAPNICo needs: keep it (kubeconfig: %s).\n",
+			cluster.Name, cluster.KubeconfigPath)
 	}
 
 	// Nico mode does not list the allocated nodes here; kubectl get nodes shows them.

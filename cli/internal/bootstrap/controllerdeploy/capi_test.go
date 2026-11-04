@@ -564,6 +564,31 @@ func TestCAPNICoSecretsManifest_Errors(t *testing.T) {
 	}
 }
 
+// TestInstallCAPNICo_ClientCredentials: the install applies the client
+// credentials Secret and the manifest, waits for the rollout, and masks the
+// client secret in diagnostics.
+func TestInstallCAPNICo_ClientCredentials(t *testing.T) {
+	const secret = "redact-me-client-secret-5c1e"
+	cfg := nicoTestConfig(t)
+	cfg.CAPNICo.Token = ""
+	cfg.CAPNICo.TokenURL = "http://192.0.2.20:8082/realms/nico/protocol/openid-connect/token"
+	cfg.CAPNICo.ClientID = "ncx-service"
+	cfg.CAPNICo.ClientSecret = secret
+	runner := &fakeRunner{}
+	if err := New(runner, nil).installCAPNICo(context.Background(), "/tmp/kubeconfig", cfg, time.Minute); err != nil {
+		t.Fatalf("installCAPNICo: %v", err)
+	}
+	if callIndex(runner, "deployment/"+capnicoDeployment) < 0 {
+		t.Errorf("did not wait for the CAPNICo rollout; calls: %+v", runner.calls)
+	}
+	if len(runner.applied) == 0 || !strings.Contains(runner.applied[0], `"clientSecret":"`+secret+`"`) {
+		t.Errorf("first apply is not the client-credentials Secret: %v", runner.applied)
+	}
+	if got := redact.Text("log: " + secret); strings.Contains(got, secret) {
+		t.Errorf("redact.Text = %q; want the client secret masked", got)
+	}
+}
+
 // TestEmbeddedCAPNICoManifest: the manifest names the namespace and the
 // Deployment the install waits for. If a bump of deploy/nico/capnico renames
 // either, this fails instead of a bootstrap hanging.

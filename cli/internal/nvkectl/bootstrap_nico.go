@@ -14,10 +14,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/controllerdeploy"
 	bootstrapengine "github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/engine"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/manifest"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicoalloc"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicodeploy"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicoingest"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitespec"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/untaint"
@@ -104,8 +108,15 @@ func (n *managedNico) removeSource() {
 }
 
 // install installs NICo in the bootstrap cluster from the release the
-// bootstrap manifest pins.
-func (n *managedNico) install(ctx context.Context, kubeconfig string, runner controllerdeploy.CommandRunner, logger *slog.Logger) error {
+// bootstrap manifest pins, and sets NICo's client credentials on cweCfg, so the
+// NVKE stack installs CAPNICo with them.
+func (n *managedNico) install(
+	ctx context.Context,
+	kubeconfig string,
+	cweCfg *controllerdeploy.Config,
+	runner controllerdeploy.CommandRunner,
+	logger *slog.Logger,
+) error {
 	dir, err := os.MkdirTemp("", "nvkectl-nico-source-")
 	if err != nil {
 		return err
@@ -123,7 +134,102 @@ func (n *managedNico) install(ctx context.Context, kubeconfig string, runner con
 	if n.inst, err = nicodeploy.New(runner, kube, logger).Install(ctx, kubeconfig, n.root, seed); err != nil {
 		return fmt.Errorf("installing NICo: %w", err)
 	}
+	cweCfg.CAPNICo = controllerdeploy.CAPNICoAccess{
+		Endpoint:     n.inst.RESTEndpoint,
+		OrgID:        n.inst.OrgID,
+		APIName:      n.inst.APIName,
+		TokenURL:     n.inst.Credentials.TokenURL,
+		ClientID:     n.inst.Credentials.ClientID,
+		ClientSecret: n.inst.Credentials.ClientSecret,
+	}
+	return nil
+}
+
+// configure ingests the site's machines into the installed NICo, creates the
+// objects CAPNICo allocates the control plane with, and points the site spec
+// at them, so the create request carries their IDs.
+func (n *managedNico) configure(
+	ctx context.Context,
+	inv *sitespec.SiteSpec,
+	kubeconfig string,
+	runner controllerdeploy.CommandRunner,
+	logger *slog.Logger,
+) error {
+	kube, err := untaint.NewClient(kubeconfig)
+	if err != nil {
+		return err
+	}
+	rest := n.inst.REST()
+	if err := nicoingest.Run(ctx, nicoingest.Config{
+		Kubeconfig: kubeconfig,
+		Settings:   n.settings,
+		Secrets:    n.secrets,
+		REST:       rest,
+		Runner:     runner,
+		Kube:       kube,
+		Logger:     logger,
+	}); err != nil {
+		return fmt.Errorf("ingesting the site's machines into NICo: %w", err)
+	}
+	serials := make([]string, 0, len(n.settings.MachineList))
+	for _, m := range n.settings.MachineList {
+		serials = append(serials, m.Serial)
+	}
+	res, err := nicoalloc.Ensure(ctx, nicoalloc.Config{
+		REST:              rest,
+		SiteID:            n.inst.SiteID,
+		Name:              inv.ClusterName,
+		Serials:           serials,
+		ControlPlaneCount: inv.ControlPlaneCount(),
+		Allocation:        n.settings.Allocation,
+		SSHPublicKey:      n.settings.SSHPublicKeyData,
+		Logger:            logger,
+	})
+	if err != nil {
+		return fmt.Errorf("creating the control plane's NICo objects: %w", err)
+	}
+	if err := pointAtNico(inv, n.inst, res); err != nil {
+		return err
+	}
 	logger.Info("NICo is ready in the bootstrap cluster", "site", n.inst.SiteID, "endpoint", n.inst.RESTEndpoint)
+	return nil
+}
+
+// pointAtNico makes the site spec name the NICo the bootstrap installed and
+// the objects nicoalloc created in it: infra.nico.remote, the org, and the
+// control plane's instance type, subnet or VPC prefix, and SSH key group.
+func pointAtNico(inv *sitespec.SiteSpec, inst *nicodeploy.Installed, res *nicoalloc.Result) error {
+	network, networkID := "subnet", res.SubnetID
+	if res.VPCPrefixID != "" {
+		network, networkID = "VPC prefix", res.VPCPrefixID
+	}
+	fields := []struct{ what, id string }{
+		{"site", inst.SiteID},
+		{"VPC", res.VPCID},
+		{"instance type", res.InstanceTypeID},
+		{"SSH key group", res.SSHKeyGroupID},
+		{network, networkID},
+	}
+	ids := make([]uuid.UUID, len(fields))
+	for i, f := range fields {
+		id, err := uuid.Parse(f.id)
+		if err != nil {
+			return fmt.Errorf("NICo returned %s ID %q, which is not a UUID: %w", f.what, f.id, err)
+		}
+		ids[i] = id
+	}
+	n := inv.Infra.Nico
+	n.OrgID = inst.OrgID
+	n.Remote = &sitespec.NicoRemote{Endpoint: inst.RESTEndpoint, SiteID: ids[0], VpcID: ids[1], APIName: inst.APIName}
+	cp := &n.ControlPlane.NicoControlPlaneProviderCreate
+	cp.InstanceTypePreference = []uuid.UUID{ids[2]}
+	cp.SSHKeyGroupIDs = []uuid.UUID{ids[3]}
+	cp.SubnetIDs, cp.VpcPrefixIDs = nil, nil
+	if res.VPCPrefixID != "" {
+		cp.VpcPrefixIDs = []uuid.UUID{ids[4]}
+	} else {
+		cp.SubnetIDs = []uuid.UUID{ids[4]}
+	}
 	return nil
 }
 
