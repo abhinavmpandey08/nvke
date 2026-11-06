@@ -4,6 +4,7 @@
 package activities
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -13,6 +14,13 @@ import (
 	"go.temporal.io/sdk/testsuite"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	nvkeproto "github.com/dsx-ai-factory/nvke/agent/pkg/agent/proto"
 
@@ -135,6 +143,7 @@ func TestConfigureKubeVip_BGPPEERASNFromProvider(t *testing.T) {
 			require.Equal(t, tt.wantSource, request.GetBgpPeerAsnSource())
 			require.Equal(t, tt.wantASN, request.GetBgpPeerAsn())
 			require.Equal(t, tt.wantFMDS, request.GetFmdsEndpoint())
+			require.Empty(t, request.GetServiceAccountToken())
 			mockDB.AssertExpectations(t)
 		})
 	}
@@ -245,4 +254,118 @@ func TestConfigureKubeVip_RPCFallbackBoundary(t *testing.T) {
 			mockDB.AssertExpectations(t)
 		})
 	}
+}
+
+func TestConfigureKubeVip_ServiceAccountToken(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		withToken   bool
+		providerErr error
+		wantToken   string
+		wantError   string
+	}{
+		"without the flag the tenant API is not touched": {
+			providerErr: context.DeadlineExceeded,
+		},
+		"with the flag the token is created and passed": {
+			withToken: true,
+			wantToken: "example-token",
+		},
+		"an unreachable tenant API fails before the agent call": {
+			withToken:   true,
+			providerErr: context.DeadlineExceeded,
+			wantError:   context.DeadlineExceeded.Error(),
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			nodeID, nodeSetID, nodePoolID, clusterID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+			node := db.Node{
+				ID: nodeID, Name: "cp-0", ClusterID: clusterID, NodeSetID: nodeSetID, NodePoolID: nodePoolID,
+				ControlPlane: true, IP: "10.0.0.20",
+			}
+			mockDB := &testutil.MockDB{}
+			mockDB.On("GetNode", mock.Anything, nodeID).Return(node, nil).Twice()
+			mockDB.On("GetNodeSet", mock.Anything, nodeSetID).Return(db.NodeSet{ID: nodeSetID, NodePoolID: nodePoolID}, nil)
+			mockDB.On("GetNodePool", mock.Anything, nodePoolID).
+				Return(db.NodePool{ID: nodePoolID, ControlPlane: true, Capi: &db.CAPINodePoolProvider{}}, nil)
+			mockDB.On("GetCluster", mock.Anything, clusterID).
+				Return(db.Cluster{ID: clusterID, ProviderType: db.ProviderTypeCAPI, ControlPlaneVIP: "10.0.0.10"}, nil).Once()
+
+			tenantClient := newKubeVipTenantClient(t)
+			fakeAgent := &agenttest.FakeClient{
+				ReconcileKubeVipResponse: &nvkeproto.ReconcileKubeVipResponse{Outcome: nvkeproto.ReconcileKubeVipResponse_OUTCOME_UPDATED},
+			}
+			a := &Activities{
+				db:                   mockDB,
+				nodeAgentClient:      fakeAgent,
+				tenantClientProvider: &fakeTenantClientProvider{tenantClient: tenantClient, err: tt.providerErr},
+			}
+			testSuite := &testsuite.WorkflowTestSuite{}
+			env := testSuite.NewTestActivityEnvironment()
+			env.RegisterActivity(a.configureKubeVip)
+			_, err := env.ExecuteActivity(a.configureKubeVip, ConfigureKubeVipInput{
+				NodeID:                  nodeID,
+				WithServiceAccountToken: tt.withToken,
+			})
+			mockDB.AssertExpectations(t)
+			if tt.wantError != "" {
+				require.ErrorContains(t, err, tt.wantError)
+				require.Empty(t, fakeAgent.ReconcileKubeVipRequests)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, fakeAgent.ReconcileKubeVipRequests, 1)
+			require.Equal(t, tt.wantToken, fakeAgent.ReconcileKubeVipRequests[0].GetServiceAccountToken())
+		})
+	}
+}
+
+func TestEnsureKubeVipServiceAccountToken(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	tenantClient := newKubeVipTenantClient(t)
+	// A drifted role is put back to the rules kube-vip needs.
+	require.NoError(t, tenantClient.Create(ctx, &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: kubeVipRBACName},
+		Rules:      []rbacv1.PolicyRule{{APIGroups: []string{"*"}, Resources: []string{"*"}, Verbs: []string{"*"}}},
+	}))
+
+	for range 2 {
+		token, err := ensureKubeVipServiceAccountToken(ctx, tenantClient)
+		require.NoError(t, err)
+		require.Equal(t, "example-token", token)
+	}
+
+	require.NoError(t, tenantClient.Get(ctx, types.NamespacedName{Namespace: metav1.NamespaceSystem, Name: kubeVipServiceAccountName}, &corev1.ServiceAccount{}))
+	var role rbacv1.ClusterRole
+	require.NoError(t, tenantClient.Get(ctx, types.NamespacedName{Name: kubeVipRBACName}, &role))
+	require.Equal(t, kubeVipRBACRules(), role.Rules)
+	var binding rbacv1.ClusterRoleBinding
+	require.NoError(t, tenantClient.Get(ctx, types.NamespacedName{Name: kubeVipRBACName}, &binding))
+	require.Equal(t, rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: kubeVipRBACName}, binding.RoleRef)
+	require.Equal(t, []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: kubeVipServiceAccountName, Namespace: metav1.NamespaceSystem}}, binding.Subjects)
+	var secret corev1.Secret
+	require.NoError(t, tenantClient.Get(ctx, types.NamespacedName{Namespace: metav1.NamespaceSystem, Name: kubeVipTokenSecretName}, &secret))
+	require.Equal(t, corev1.SecretTypeServiceAccountToken, secret.Type)
+	require.Equal(t, kubeVipServiceAccountName, secret.Annotations[corev1.ServiceAccountNameKey])
+}
+
+// newKubeVipTenantClient seeds the token Secret with data, standing in for
+// kube-controller-manager's token controller, which the fake client lacks.
+func newKubeVipTenantClient(t *testing.T) client.Client {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, rbacv1.AddToScheme(scheme))
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceSystem, Name: kubeVipTokenSecretName},
+		Type:       corev1.SecretTypeServiceAccountToken,
+		Data:       map[string][]byte{corev1.ServiceAccountTokenKey: []byte("example-token")},
+	}).Build()
 }

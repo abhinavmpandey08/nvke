@@ -24,6 +24,10 @@ const (
 	// psaLabelSystemNamespacesChangeID gates LabelSystemNamespacesForPSA in
 	// every workflow that runs it.
 	psaLabelSystemNamespacesChangeID = "psa-label-system-namespaces"
+
+	// kubeVipServiceAccountTokenChangeID gates the initial node's second
+	// kube-vip reconcile, which hands kube-vip its service-account token.
+	kubeVipServiceAccountTokenChangeID = "kube-vip-service-account-token" //nolint:gosec // Temporal change ID, not a credential.
 )
 
 type ProvisionClusterInput struct {
@@ -60,7 +64,7 @@ func provisionCluster(ctx workflow.Context, input ProvisionClusterInput) error {
 		return fmt.Errorf("failed to wait for a control plane node to be ready to join: %w", err)
 	}
 
-	if err := configureInitialNodeKubeVip(ctx, input.ClusterID, initialNodeID); err != nil {
+	if err := configureInitialNodeKubeVip(ctx, input.ClusterID, initialNodeID, false); err != nil {
 		return fmt.Errorf("failed to configure initial node KubeVip: %w", err)
 	}
 
@@ -82,6 +86,14 @@ func provisionCluster(ctx workflow.Context, input ProvisionClusterInput) error {
 	if workflow.GetVersion(ctx, psaLabelSystemNamespacesChangeID, workflow.DefaultVersion, 1) >= 1 {
 		if err := labelSystemNamespacesForPSA(ctx, input.ClusterID, "Labeling system namespaces for Pod Security Admission"); err != nil {
 			return err
+		}
+	}
+
+	// The first kube-vip reconcile ran before the API server existed, so it had
+	// no token. Clusters provisioned before this step existed must replay without it.
+	if workflow.GetVersion(ctx, kubeVipServiceAccountTokenChangeID, workflow.DefaultVersion, 1) >= 1 {
+		if err := configureInitialNodeKubeVip(ctx, input.ClusterID, initialNodeID, true); err != nil {
+			return fmt.Errorf("failed to configure initial node kube-vip service mode: %w", err)
 		}
 	}
 
@@ -143,7 +155,10 @@ func waitForControlPlaneNodeReadyToJoin(ctx workflow.Context, clusterID uuid.UUI
 	return result.NodeID, nil
 }
 
-func configureInitialNodeKubeVip(ctx workflow.Context, clusterID, initialNodeID uuid.UUID) error {
+// configureInitialNodeKubeVip reconciles kube-vip on the initial node. The
+// first call runs before kubeadm init, so withServiceAccountToken must be false
+// until the API server is up.
+func configureInitialNodeKubeVip(ctx workflow.Context, clusterID, initialNodeID uuid.UUID, withServiceAccountToken bool) error {
 	var a *activities.Activities
 
 	activityOptions := workflow.ActivityOptions{
@@ -162,6 +177,7 @@ func configureInitialNodeKubeVip(ctx workflow.Context, clusterID, initialNodeID 
 			NodeID:                              initialNodeID,
 			ClusterID:                           clusterID,
 			ConfigureSuperAdmin:                 false, // Not needed on the initial node because it already has the super-admin kubeconfig
+			WithServiceAccountToken:             withServiceAccountToken,
 			ClusterProvisioningConditionMessage: "Configuring kube-vip on initial node",
 		},
 	).Get(ctx, nil); err != nil {

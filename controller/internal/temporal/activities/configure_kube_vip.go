@@ -6,11 +6,19 @@ package activities
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"go.temporal.io/sdk/activity"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	nvkeproto "github.com/dsx-ai-factory/nvke/agent/pkg/agent/proto"
 
@@ -21,7 +29,30 @@ import (
 const (
 	configureKubeVipRunbookName = "configure-kube-vip"
 	fmdsBGPPeerAS               = "FROM_FMDS"
+
+	kubeVipServiceAccountName = "kube-vip"
+	kubeVipTokenSecretName    = "kube-vip-token" //nolint:gosec // Secret name, not a credential.
+	kubeVipRBACName           = "nvke:kube-vip"
+	// kubeVipTokenWait bounds the wait for kube-controller-manager's token
+	// controller to fill the token Secret within one activity attempt.
+	kubeVipTokenWait = 30 * time.Second
 )
+
+// kubeVipRBACRules is what kube-vip's service mode needs to serve
+// LoadBalancer Services of its class with externalTrafficPolicy Local.
+func kubeVipRBACRules() []rbacv1.PolicyRule {
+	const update = "update"
+	read := []string{"get", "list", "watch"}
+	return []rbacv1.PolicyRule{
+		// kube-vip writes its vipHost annotation with an update before it sets the status.
+		{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get", "list", "watch", update}},
+		{APIGroups: []string{""}, Resources: []string{"services/status"}, Verbs: []string{update, "patch"}},
+		{APIGroups: []string{""}, Resources: []string{"endpoints"}, Verbs: read},
+		{APIGroups: []string{discoveryv1.GroupName}, Resources: []string{"endpointslices"}, Verbs: read},
+		{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: read},
+		{APIGroups: []string{"coordination.k8s.io"}, Resources: []string{"leases"}, Verbs: []string{"get", "create", update}},
+	}
+}
 
 type ConfigureKubeVipInput struct {
 	NodeID    uuid.UUID
@@ -29,6 +60,10 @@ type ConfigureKubeVipInput struct {
 	// ConfigureSuperAdmin is used only by the mixed-fleet legacy fallback.
 	// Typed reconciliation never creates an elevated kubeconfig.
 	ConfigureSuperAdmin bool
+	// WithServiceAccountToken says the cluster's API server is reachable, so
+	// kube-vip's service account and its token are created there and the token
+	// is passed to the node agent, which turns on kube-vip's service mode.
+	WithServiceAccountToken bool
 
 	NodeProvisioningConditionMessage    string
 	ClusterProvisioningConditionMessage string
@@ -129,19 +164,31 @@ func (a *Activities) configureKubeVip(ctx context.Context, input ConfigureKubeVi
 		"nodeIP", node.IP,
 		"kubeVipASN", kubeVipASN,
 		"bgpPeerAS", bgpPeerAS,
+		"withServiceAccountToken", input.WithServiceAccountToken,
 	)
 
 	// Assume host ID is the same as node ID by convention
 	hostID := node.ID
 	heartbeatCancel := startActivityHeartbeat(ctx)
 	defer heartbeatCancel()
+	var serviceAccountToken string
+	if input.WithServiceAccountToken {
+		tenantClient, err := a.tenantClientForCluster(ctx, cluster)
+		if err != nil {
+			return ConfigureKubeVipResult{}, err
+		}
+		if serviceAccountToken, err = ensureKubeVipServiceAccountToken(ctx, tenantClient); err != nil {
+			return ConfigureKubeVipResult{}, err
+		}
+	}
 	reconcileResponse, err := a.nodeAgentClient.ReconcileKubeVip(ctx, node, &nvkeproto.ReconcileKubeVipRequest{
-		VipAddress:       cluster.ControlPlaneVIP,
-		BgpAsn:           kubeVipASN,
-		NodeIp:           node.IP,
-		BgpPeerAsnSource: bgpPeerASNSource,
-		BgpPeerAsn:       bgpPeerASN,
-		FmdsEndpoint:     fmdsEndpoint,
+		VipAddress:          cluster.ControlPlaneVIP,
+		BgpAsn:              kubeVipASN,
+		NodeIp:              node.IP,
+		BgpPeerAsnSource:    bgpPeerASNSource,
+		BgpPeerAsn:          bgpPeerASN,
+		FmdsEndpoint:        fmdsEndpoint,
+		ServiceAccountToken: serviceAccountToken,
 	})
 	if err == nil {
 		if reconcileResponse == nil {
@@ -213,4 +260,57 @@ func (a *Activities) configureKubeVip(ctx context.Context, input ConfigureKubeVi
 		ConfigureSuperAdminOutput: configureSuperAdminOutput,
 		ConfigureKubeVipOutput:    configureKubeVipResult.Output,
 	}, nil
+}
+
+// ensureKubeVipServiceAccountToken creates or updates kube-system/kube-vip,
+// its RBAC and its token Secret in the workload cluster, then returns the
+// token. The token is a credential: callers must never log it.
+func ensureKubeVipServiceAccountToken(ctx context.Context, tenantClient ctrlclient.Client) (string, error) {
+	serviceAccount := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: kubeVipServiceAccountName, Namespace: metav1.NamespaceSystem},
+	}
+	role := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: kubeVipRBACName}}
+	binding := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: kubeVipRBACName}}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: kubeVipTokenSecretName, Namespace: metav1.NamespaceSystem},
+	}
+	objects := []struct {
+		object ctrlclient.Object
+		mutate func()
+	}{
+		{serviceAccount, func() {}},
+		{role, func() { role.Rules = kubeVipRBACRules() }},
+		{binding, func() {
+			binding.RoleRef = rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: kubeVipRBACName}
+			binding.Subjects = []rbacv1.Subject{{
+				Kind:      rbacv1.ServiceAccountKind,
+				Name:      kubeVipServiceAccountName,
+				Namespace: metav1.NamespaceSystem,
+			}}
+		}},
+		{secret, func() {
+			secret.Type = corev1.SecretTypeServiceAccountToken
+			metav1.SetMetaDataAnnotation(&secret.ObjectMeta, corev1.ServiceAccountNameKey, kubeVipServiceAccountName)
+		}},
+	}
+	for _, current := range objects {
+		if _, err := controllerutil.CreateOrUpdate(ctx, tenantClient, current.object, func() error {
+			current.mutate()
+			return nil
+		}); err != nil {
+			return "", fmt.Errorf("applying kube-vip %T %s: %w", current.object, current.object.GetName(), err)
+		}
+	}
+
+	// kube-controller-manager's token controller fills the Secret asynchronously.
+	key := ctrlclient.ObjectKeyFromObject(secret)
+	if err := wait.PollUntilContextTimeout(ctx, time.Second, kubeVipTokenWait, true, func(ctx context.Context) (bool, error) {
+		if err := tenantClient.Get(ctx, key, secret); err != nil {
+			return false, err
+		}
+		return len(secret.Data[corev1.ServiceAccountTokenKey]) > 0, nil
+	}); err != nil {
+		return "", fmt.Errorf("waiting for the token in Secret %s: %w", key, err)
+	}
+	return string(secret.Data[corev1.ServiceAccountTokenKey]), nil
 }

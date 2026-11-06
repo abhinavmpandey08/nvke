@@ -894,8 +894,10 @@ func configureKubeVip(ctx workflow.Context, nodeID uuid.UUID) error {
 		workflow.WithActivityOptions(ctx, activityOptions),
 		a.ConfigureKubeVip,
 		activities.ConfigureKubeVipInput{
-			NodeID:                           nodeID,
-			ConfigureSuperAdmin:              true,
+			NodeID:              nodeID,
+			ConfigureSuperAdmin: true,
+			// The node has joined, so the cluster's API server is up.
+			WithServiceAccountToken:          true,
 			NodeProvisioningConditionMessage: "Configuring kube-vip",
 		},
 	).Get(ctx, nil); err != nil {

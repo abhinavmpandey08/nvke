@@ -109,3 +109,43 @@ func TestLabelSystemNamespacesForPSARetriesAreBounded(t *testing.T) {
 func labelSystemNamespacesForPSATestWorkflow(ctx workflow.Context, clusterID uuid.UUID) error {
 	return labelSystemNamespacesForPSA(ctx, clusterID, "Labeling system namespaces for Pod Security Admission")
 }
+
+func TestConfigureInitialNodeKubeVipPassesTheTokenFlag(t *testing.T) {
+	clusterID, nodeID := uuid.New(), uuid.New()
+	testSuite := &testsuite.WorkflowTestSuite{}
+	env := testSuite.NewTestWorkflowEnvironment()
+	a := &activities.Activities{}
+
+	env.OnActivity(a.ConfigureKubeVip, mock.Anything, activities.ConfigureKubeVipInput{
+		NodeID:                              nodeID,
+		ClusterID:                           clusterID,
+		WithServiceAccountToken:             true,
+		ClusterProvisioningConditionMessage: "Configuring kube-vip on initial node",
+	}).Return(activities.ConfigureKubeVipResult{}, nil).Once()
+
+	env.ExecuteWorkflow(configureInitialNodeKubeVip, clusterID, nodeID, true)
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	env.AssertExpectations(t)
+}
+
+func TestConfigureKubeVipOnJoinPassesTheToken(t *testing.T) {
+	nodeID := uuid.New()
+	testSuite := &testsuite.WorkflowTestSuite{}
+	env := testSuite.NewTestWorkflowEnvironment()
+	a := &activities.Activities{}
+
+	env.OnActivity(a.ConfigureKubeVip, mock.Anything, activities.ConfigureKubeVipInput{
+		NodeID:                           nodeID,
+		ConfigureSuperAdmin:              true,
+		WithServiceAccountToken:          true,
+		NodeProvisioningConditionMessage: "Configuring kube-vip",
+	}).Return(activities.ConfigureKubeVipResult{}, nil).Once()
+
+	env.ExecuteWorkflow(configureKubeVip, nodeID)
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	env.AssertExpectations(t)
+}
