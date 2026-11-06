@@ -1,0 +1,107 @@
+# A complete NICo settings file for the site cluster site-a.
+apiHostname: api.site-a.example.com
+images:
+  registry: registry.example.com/nico
+  coreTag: v2.2.2
+  restTag: v2.2.2
+  bootArtifactsX86_64: registry.example.com/nico/boot-artifacts-x86_64:v2.2.2
+  bootArtifactsAarch64: registry.example.com/nico/boot-artifacts-aarch64:v2.2.2
+  machineValidation: registry.example.com/nico/machine-validation-config:v2.2.2
+  unbound: registry.example.com/nico/unbound:1.20.0
+  unboundExporter: registry.example.com/nico/unbound_exporter:0.4.6
+addresses:
+  dhcp: 192.0.2.10
+  pxe: 192.0.2.11
+  api: 192.0.2.12
+  rest: 192.0.2.13
+  keycloak: 192.0.2.14
+  dns: 192.0.2.15
+  ntp: [192.0.2.16, 192.0.2.17, 192.0.2.18]
+upstreamDNS: [198.51.100.53]
+bgp:
+  seed:
+    asn: 65010
+    peers:
+      - address: 10.0.0.1
+        asn: 65000
+site:
+  storageClass: example-storage
+allocation:
+  vpcType: ethernetVirtualizer
+  tenantBlockPrefixLength: 24
+  subnetPrefixLength: 26
+  sshPublicKey: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFaUvKa5gh7fX1JoWzi2kpa8cZBzIOdt36jSRbxyzYyG example@nvke
+machines:
+  - name: host-a
+    bmcMAC: "02:00:00:00:00:01"
+    serial: SN-A
+    bmcLogin: NICO_BMC_EXAMPLE
+  - name: host-b
+    bmcMAC: "02:00:00:00:00:02"
+    serial: SN-B
+    bmcLogin: NICO_BMC_EXAMPLE
+    dpuPolicy: nic
+    bootNICMAC: "02:00:00:00:01:02"
+    dpus:
+      - serial: DPU-SN-B
+        bmcMAC: "02:00:00:00:02:02"
+        bmcIP: 10.2.0.20
+coreValues:
+  nico-api:
+    hostname: api.site-a.example.com
+    siteConfig:
+      enabled: true
+      nicoApiSiteConfig: |
+        sitename = "site-a"
+        initial_domain_name = "site-a.example.com"
+        attestation_enabled = false
+        dhcp_servers = ["192.0.2.10"]
+        ntp_servers = ["192.0.2.16", "192.0.2.17", "192.0.2.18"]
+        site_fabric_prefixes = ["10.100.0.0/16"]
+        deny_prefixes = ["10.0.0.0/16"]
+  
+        [site_explorer]
+        run_interval = "30s"
+  
+        [machine_validation_config]
+        enabled = true
+  
+        [firmware_global]
+        autoupdate = false
+  
+        [pools.lo-ip]
+        type = "ipv4"
+        ranges = [{ start = "10.200.0.1", end = "10.200.0.254" }]
+  
+        [pools.vlan-id]
+        type = "integer"
+        ranges = [{ start = "100", end = "501" }]
+  
+        [pools.vni]
+        type = "integer"
+        ranges = [{ start = "1024500", end = "1024800" }]
+  
+        [pools.vpc-vni]
+        type = "integer"
+        ranges = [{ start = "0", end = "100" }]
+  
+        [networks.admin]
+        type = "admin"
+        prefix = "10.1.0.0/24"
+        gateway = "10.1.0.1"
+        mtu = 9000
+        reserve_first = 5
+  
+        [networks.oob]
+        type = "underlay"
+        prefix = "10.2.0.0/24"
+        gateway = "10.2.0.1"
+        mtu = 1500
+        reserve_first = 2
+  
+        [networks.inband]
+        type = "hostinband"
+        prefix = "10.3.0.0/24"
+        gateway = "10.3.0.1"
+        mtu = 9000
+        reserve_first = 5

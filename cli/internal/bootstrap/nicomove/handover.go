@@ -42,14 +42,12 @@ func (m *mover) writeHandover(ctx context.Context, dir string, carried nicodeplo
 			return err
 		}
 	}
-	for _, f := range [][2]string{{s.Path, "settings.yaml"}, {s.Machines, "machines.yaml"}, {s.CoreValues, "core-values.yaml"}} {
-		b, err := os.ReadFile(f[0])
-		if err != nil {
-			return fmt.Errorf("copying %s into the handover bundle: %w", f[0], err)
-		}
-		if err := writePrivate(filepath.Join(inputs, f[1]), b); err != nil {
-			return err
-		}
+	settings, err := os.ReadFile(s.Path)
+	if err != nil {
+		return fmt.Errorf("copying %s into the handover bundle: %w", s.Path, err)
+	}
+	if err := writePrivate(filepath.Join(inputs, "settings.yaml"), settings); err != nil {
+		return err
 	}
 	if err := m.site.WriteHelmValues(ctx, m.cfg.SiteKubeconfig, values); err != nil {
 		return err
@@ -70,13 +68,11 @@ func (m *mover) writeHandover(ctx context.Context, dir string, carried nicodeplo
 		"rest-ca.crt":                      carried.RESTCA.Data[corev1.TLSCertKey],
 		"rest-ca.key":                      carried.RESTCA.Data[corev1.TLSPrivateKeyKey],
 	}
-	if login := carried.KeycloakLogin; login != nil {
-		b, err := yaml.Marshal(map[string]string{"username": "admin", "password": string(login.Data["admin-password"])})
-		if err != nil {
-			return err
-		}
-		files["keycloak-admin.yaml"] = b
+	login, err := yaml.Marshal(map[string]string{"username": "admin", "password": string(carried.KeycloakLogin.Data["admin-password"])})
+	if err != nil {
+		return err
 	}
+	files["keycloak-admin.yaml"] = login
 	for name, b := range files {
 		if err := writePrivate(filepath.Join(dir, name), b); err != nil {
 			return err

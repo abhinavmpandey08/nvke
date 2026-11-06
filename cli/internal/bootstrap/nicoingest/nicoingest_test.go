@@ -47,7 +47,7 @@ func TestExpectedMachineArgs(t *testing.T) {
 			name: "every optional field",
 			machine: nicosettings.Machine{
 				Name: "h2", BMCMAC: "aa:bb:cc:dd:ee:02", Serial: "S2", BMCLogin: "H2",
-				RetainBMCPassword: true, DPUPolicy: nicosettings.DPUPolicyNIC, BMCIP: "10.0.0.2", SKU: "sku-1",
+				RetainBMCPassword: true, DPUPolicy: nicosettings.DPUPolicyNIC, BMCIP: "10.0.0.2",
 				BootNICMAC: "aa:bb:cc:00:00:02", BootNICIP: "10.1.0.2",
 				DPUs: []nicosettings.DPU{
 					{Serial: "D1", BMCMAC: "aa:bb:cc:00:01:01", BMCIP: "10.2.0.1", OSMAC: "aa:bb:cc:00:02:01", OSIP: "10.3.0.1"},
@@ -57,7 +57,7 @@ func TestExpectedMachineArgs(t *testing.T) {
 			want: []string{
 				"expected-machine", "add", "--bmc-mac-address=aa:bb:cc:dd:ee:02", "--bmc-username=root",
 				"--bmc-password=-pa ss'word", "--chassis-serial-number=S2", "--meta-name=h2",
-				"--bmc-retain-credentials=true", "--dpu-policy=nic", "--bmc-ip-address=10.0.0.2", "--sku-id=sku-1",
+				"--bmc-retain-credentials=true", "--dpu-policy=nic", "--bmc-ip-address=10.0.0.2",
 				"--fallback-dpu-serial-number=D1", "--fallback-dpu-serial-number=D2",
 				`--interfaces=[{"mac_address":"aa:bb:cc:00:00:02","role":"host","fixed_ip":"10.1.0.2","primary":true,"network_segment_type":3},` +
 					`{"mac_address":"aa:bb:cc:00:01:01","role":"dpu_bmc","fixed_ip":"10.2.0.1"},` +
@@ -236,11 +236,10 @@ func bmcMachine(mac, status string) map[string]any {
 func testConfig(t *testing.T, kube kubernetes.Interface, runner CommandRunner, rest *nicorest.Client) Config {
 	t.Helper()
 	settings := &nicosettings.Settings{
-		File: nicosettings.File{DPUFactoryModels: []string{"bf3"}},
-		MachineList: []nicosettings.Machine{
+		File: nicosettings.File{DPUFactoryModels: []string{"bf3"}, Machines: []nicosettings.Machine{
 			{Name: "h1", BMCMAC: "aa:bb:cc:dd:ee:01", Serial: "S1", BMCLogin: "H1"},
 			{Name: "h2", BMCMAC: "aa:bb:cc:dd:ee:02", Serial: "S2", BMCLogin: "H2"},
-		},
+		}},
 		SiteConfig: nicosettings.SiteConfig{AttestationEnabled: true},
 	}
 	return Config{

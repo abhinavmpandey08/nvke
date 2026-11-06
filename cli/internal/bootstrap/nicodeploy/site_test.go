@@ -39,7 +39,7 @@ func (r *recordingRunner) index(want string) int {
 func TestMetalLBPool(t *testing.T) {
 	a := nicosettings.Addresses{
 		DHCP: "10.0.0.67", PXE: "10.0.0.80", API: "10.0.0.43", REST: "10.0.0.88", Keycloak: "fd00::82",
-		NTP: []string{"10.0.0.123", "10.0.0.124"}, SSHConsole: "10.0.0.80",
+		NTP: []string{"10.0.0.123", "10.0.0.124"},
 	}
 	out, err := metalLBPool(a)
 	require.NoError(t, err)
@@ -140,11 +140,10 @@ func TestReadCarriedThenApply(t *testing.T) {
 		}
 	}
 	tests := []struct {
-		name      string
-		seed      []runtime.Object
-		wantSSH   bool
-		wantLogin bool
-		wantErr   bool
+		name    string
+		seed    []runtime.Object
+		wantSSH bool
+		wantErr bool
 	}{
 		{
 			name: "every Secret is carried",
@@ -152,11 +151,16 @@ func TestReadCarriedThenApply(t *testing.T) {
 				secret(certManagerNS, siteRootSecret), secret(restNamespace, restCASecret),
 				secret(nicoNamespace, sshHostKeySecret), secret(restNamespace, keycloakLoginSecret),
 			},
-			wantSSH: true, wantLogin: true,
+			wantSSH: true,
 		},
 		{
-			name: "the SSH host key and the Keycloak login are optional",
-			seed: []runtime.Object{secret(certManagerNS, siteRootSecret), secret(restNamespace, restCASecret)},
+			name: "the SSH host key is optional",
+			seed: []runtime.Object{secret(certManagerNS, siteRootSecret), secret(restNamespace, restCASecret), secret(restNamespace, keycloakLoginSecret)},
+		},
+		{
+			name:    "the Keycloak login is required",
+			seed:    []runtime.Object{secret(certManagerNS, siteRootSecret), secret(restNamespace, restCASecret)},
+			wantErr: true,
 		},
 		{name: "the site root CA is required", seed: []runtime.Object{secret(restNamespace, restCASecret)}, wantErr: true},
 	}
@@ -169,16 +173,12 @@ func TestReadCarriedThenApply(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantSSH, carried.SSHHostKey != nil)
-			assert.Equal(t, tt.wantLogin, carried.KeycloakLogin != nil)
 
 			site := fake.NewClientset()
 			require.NoError(t, New(nil, site, discardLog()).applyCarried(ctx, carried))
-			want := [][2]string{{certManagerNS, siteRootSecret}, {restNamespace, restCASecret}, {certManagerNS, restCASecret}}
+			want := [][2]string{{certManagerNS, siteRootSecret}, {restNamespace, restCASecret}, {certManagerNS, restCASecret}, {restNamespace, keycloakLoginSecret}}
 			if tt.wantSSH {
 				want = append(want, [2]string{nicoNamespace, sshHostKeySecret})
-			}
-			if tt.wantLogin {
-				want = append(want, [2]string{restNamespace, keycloakLoginSecret})
 			}
 			for _, w := range want {
 				got, err := site.CoreV1().Secrets(w[0]).Get(ctx, w[1], metav1.GetOptions{})
@@ -197,7 +197,7 @@ func TestReadCarriedThenApply(t *testing.T) {
 }
 
 func TestPrereqsValuesCarriedSiteRoot(t *testing.T) {
-	cfg := restTestConfig(false)
+	cfg := restTestConfig()
 	assert.Nil(t, valueAt(prereqsValues(cfg, "token", nil), "certManager"), "the chart issues the site root CA by default")
 	cfg.siteRootCarried = true
 	assert.Equal(t, false, valueAt(prereqsValues(cfg, "token", nil), "certManager", "siteRoot", "create"))

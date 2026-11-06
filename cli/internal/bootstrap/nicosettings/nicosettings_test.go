@@ -13,23 +13,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fixture copies testdata into a temporary directory, applies each edit to the
-// file it names, and returns the copied settings file's path.
-func fixture(t *testing.T, edits map[string]func(string) string) string {
+// exampleKey is the fixture's SSH public key.
+const exampleKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFaUvKa5gh7fX1JoWzi2kpa8cZBzIOdt36jSRbxyzYyG example@nvke"
+
+// fixture writes testdata/nico.yaml, with each edit applied, into a temporary
+// directory and returns its path.
+func fixture(t *testing.T, edits ...func(string) string) string {
 	t.Helper()
-	dir := t.TempDir()
-	entries, err := os.ReadDir("testdata")
+	data, err := os.ReadFile(filepath.Join("testdata", "nico.yaml"))
 	require.NoError(t, err)
-	for _, e := range entries {
-		data, err := os.ReadFile(filepath.Join("testdata", e.Name()))
-		require.NoError(t, err)
-		content := string(data)
-		if edit := edits[e.Name()]; edit != nil {
-			content = edit(content)
-		}
-		require.NoError(t, os.WriteFile(filepath.Join(dir, e.Name()), []byte(content), 0o600))
+	content := string(data)
+	for _, edit := range edits {
+		content = edit(content)
 	}
-	return filepath.Join(dir, "settings.yaml")
+	path := filepath.Join(t.TempDir(), "nico.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	return path
 }
 
 // replace returns an edit that replaces from with to, failing when from is absent.
@@ -40,23 +39,24 @@ func replace(t *testing.T, from, to string) func(string) string {
 	}
 }
 
-func TestLoad_ResolvesAndReadsEverything(t *testing.T) {
-	path := fixture(t, nil)
-	dir := filepath.Dir(path)
+func TestLoad_ReadsEverything(t *testing.T) {
+	path := fixture(t)
+	handover := filepath.Join(t.TempDir(), "site-a-nico-handover")
 
-	s, err := Load(path)
+	s, err := Load(path, handover)
 	require.NoError(t, err)
 
 	assert.Equal(t, path, s.Path)
-	assert.Equal(t, filepath.Join(dir, "nico-core.yaml"), s.CoreValues)
-	assert.Equal(t, filepath.Join(dir, "machines.yaml"), s.Machines)
-	assert.Equal(t, filepath.Join(dir, "id.pub"), s.Allocation.SSHPublicKey)
-	assert.Equal(t, filepath.Join(dir, "handover"), s.HandoverDir)
-	assert.Equal(t, "ssh-ed25519 AAAAexample-public-key example@nvke", s.SSHPublicKeyData)
+	assert.Equal(t, handover, s.HandoverDir)
+	assert.Equal(t, exampleKey, s.Allocation.SSHPublicKey)
 	assert.Equal(t, DefaultOrgID, s.EffectiveOrgID())
-	require.Len(t, s.MachineList, 2)
-	assert.Equal(t, DPUPolicyNIC, s.MachineList[1].DPUPolicy)
-	assert.Equal(t, "10.2.0.20", s.MachineList[1].DPUs[0].BMCIP)
+	require.Len(t, s.Machines, 2)
+	assert.Equal(t, DPUPolicyNIC, s.Machines[1].DPUPolicy)
+	assert.Equal(t, "10.2.0.20", s.Machines[1].DPUs[0].BMCIP)
+	assert.Equal(t, BGPSpeaker{ASN: 65010, Peers: []BGPPeer{{Address: "10.0.0.1", ASN: 65000}}}, s.BGP.Seed)
+	assert.Equal(t, "192.0.2.13:8388", s.Addresses.RESTEndpoint().String())
+	assert.Equal(t, "192.0.2.14:8082", s.Addresses.KeycloakEndpoint().String())
+	assert.Equal(t, "api.site-a.example.com", s.CoreValues["nico-api"].(map[string]any)["hostname"])
 
 	sc := s.SiteConfig
 	assert.Equal(t, "site-a", sc.SiteName)
@@ -72,75 +72,83 @@ func TestLoad_ResolvesAndReadsEverything(t *testing.T) {
 	assert.Equal(t, []PoolRange{{Start: "100", End: "501"}}, sc.Pools["vlan-id"].Ranges)
 }
 
-func TestLoad_KeepsAbsolutePaths(t *testing.T) {
-	other := t.TempDir()
-	key := filepath.Join(other, "key.pub")
-	require.NoError(t, os.WriteFile(key, []byte("ssh-ed25519 AAAAexample other\n"), 0o600))
-	path := fixture(t, map[string]func(string) string{"settings.yaml": replace(t, "sshPublicKey: id.pub", "sshPublicKey: "+key)})
+func TestLoad_TrimsABlockScalarKey(t *testing.T) {
+	path := fixture(t, replace(t, "  sshPublicKey: "+exampleKey, "  sshPublicKey: |\n    "+exampleKey))
 
-	s, err := Load(path)
+	s, err := Load(path, "")
 	require.NoError(t, err)
-	assert.Equal(t, key, s.Allocation.SSHPublicKey)
-	assert.Equal(t, "ssh-ed25519 AAAAexample other", s.SSHPublicKeyData)
+	assert.Equal(t, exampleKey, s.Allocation.SSHPublicKey)
 }
 
 func TestLoad_Refuses(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
-		edits   map[string]func(string) string
-		remove  string
+		edit    func(string) string
 		wantErr []string
 	}{
 		{
 			name:    "an unknown field in the settings",
-			edits:   map[string]func(string) string{"settings.yaml": func(s string) string { return s + "apiHostnmae: typo\n" }},
+			edit:    func(s string) string { return s + "apiHostnmae: typo\n" },
 			wantErr: []string{"apiHostnmae"},
 		},
 		{
-			name:    "an unknown field in the machines file",
-			edits:   map[string]func(string) string{"machines.yaml": func(s string) string { return s + "  sereal: typo\n" }},
-			wantErr: []string{"machines ", "sereal"},
+			name:    "an unknown field in a machine",
+			edit:    replace(t, "    serial: SN-A\n", "    serial: SN-A\n    sereal: typo\n"),
+			wantErr: []string{"sereal"},
+		},
+		{
+			name:    "an unknown field in bgp",
+			edit:    replace(t, "  seed:\n    asn: 65010\n", "  seed:\n    asn: 65010\n    holdTime: 90\n"),
+			wantErr: []string{"holdTime"},
+		},
+		{
+			name:    "the removed bgp.site",
+			edit:    replace(t, "bgp:\n", "bgp:\n  site:\n    asn: 65020\n"),
+			wantErr: []string{"field site not found"},
+		},
+		{
+			name:    "the removed handoverDir",
+			edit:    replace(t, "apiHostname: api.site-a.example.com\n", "apiHostname: api.site-a.example.com\nhandoverDir: handover\n"),
+			wantErr: []string{"handoverDir"},
 		},
 		{
 			name:    "an empty settings file",
-			edits:   map[string]func(string) string{"settings.yaml": func(string) string { return "" }},
+			edit:    func(string) string { return "" },
 			wantErr: []string{"the file is empty"},
 		},
 		{
-			name:    "a missing machines file",
-			remove:  "machines.yaml",
-			wantErr: []string{"machines ", "no such file"},
+			name: "no machines, Core values or SSH public key",
+			edit: func(s string) string {
+				s = s[:strings.Index(s, "machines:\n")]
+				return strings.Replace(s, "  sshPublicKey: "+exampleKey+"\n", "", 1)
+			},
+			wantErr: []string{"allocation.sshPublicKey is required", "coreValues is required", "machines is required"},
 		},
 		{
-			name:    "a missing SSH public key and Core values",
-			remove:  "id.pub",
-			edits:   map[string]func(string) string{"settings.yaml": replace(t, "coreValues: nico-core.yaml", "coreValues: absent.yaml")},
-			wantErr: []string{"allocation.sshPublicKey: ", "coreValues: "},
+			name:    "an SSH public key that is a path",
+			edit:    replace(t, "sshPublicKey: "+exampleKey, "sshPublicKey: id.pub"),
+			wantErr: []string{"allocation.sshPublicKey must be one OpenSSH public key"},
 		},
 		{
-			name:    "an empty SSH public key",
-			edits:   map[string]func(string) string{"id.pub": func(string) string { return "\n" }},
-			wantErr: []string{"allocation.sshPublicKey", "is empty"},
+			name:    "an SSH public key whose type is not its key's",
+			edit:    replace(t, "sshPublicKey: ssh-ed25519 ", "sshPublicKey: ssh-rsa "),
+			wantErr: []string{"allocation.sshPublicKey must be one OpenSSH public key"},
 		},
 		{
 			name:    "a site name that is not a DNS label",
-			edits:   map[string]func(string) string{"nico-core.yaml": replace(t, `sitename = "site-a"`, `sitename = "Site_A"`)},
+			edit:    replace(t, `sitename = "site-a"`, `sitename = "Site_A"`),
 			wantErr: []string{`sitename "Site_A" must be a lowercase DNS label`},
 		},
 		{
 			name: "several problems at once",
-			edits: map[string]func(string) string{"settings.yaml": func(s string) string {
+			edit: func(s string) string {
 				return strings.NewReplacer("apiHostname: api.site-a.example.com\n", "", "  pxe: 192.0.2.11\n", "").Replace(s)
-			}},
+			},
 			wantErr: []string{"apiHostname is required\naddresses.pxe is required"},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			path := fixture(t, tt.edits)
-			if tt.remove != "" {
-				require.NoError(t, os.Remove(filepath.Join(filepath.Dir(path), tt.remove)))
-			}
-			s, err := Load(path)
+			s, err := Load(fixture(t, tt.edit), "")
 			require.Error(t, err)
 			assert.Nil(t, s)
 			for _, want := range tt.wantErr {
@@ -190,6 +198,38 @@ func TestValidate(t *testing.T) {
 			wantErr: "addresses.api and addresses.rest are both 192.0.2.12",
 		},
 		{
+			name: "REST and Keycloak on one address and their own ports",
+			mutate: func(s *Settings) {
+				s.Addresses.REST, s.Addresses.Keycloak = "10.180.126.250:30388", "10.180.126.250:30082"
+			},
+			wantErr: "",
+		},
+		{
+			name:    "REST and Keycloak on one address and port",
+			mutate:  func(s *Settings) { s.Addresses.REST, s.Addresses.Keycloak = "192.0.2.13:8082", "192.0.2.13" },
+			wantErr: "addresses.rest and addresses.keycloak are both 192.0.2.13:8082: services that share an address need different ports",
+		},
+		{
+			name:    "Keycloak on another service's address, on another port",
+			mutate:  func(s *Settings) { s.Addresses.Keycloak = "192.0.2.12:30082" },
+			wantErr: "addresses.api and addresses.keycloak are both 192.0.2.12: each service needs its own address",
+		},
+		{
+			name:    "an IPv6 REST address with a port",
+			mutate:  func(s *Settings) { s.Addresses.REST = "[2001:db8::13]:30388" },
+			wantErr: "",
+		},
+		{
+			name:    "a REST port that is not a port",
+			mutate:  func(s *Settings) { s.Addresses.REST = "192.0.2.13:http" },
+			wantErr: `addresses.rest "192.0.2.13:http" is not an IP address or IP:port`,
+		},
+		{
+			name:    "a Keycloak port of 0",
+			mutate:  func(s *Settings) { s.Addresses.Keycloak = "192.0.2.14:0" },
+			wantErr: `addresses.keycloak "192.0.2.14:0" has port 0`,
+		},
+		{
 			name:    "an NTP address shared with DNS",
 			mutate:  func(s *Settings) { s.Addresses.NTP[2] = s.Addresses.DNS },
 			wantErr: "addresses.dns and addresses.ntp[2] are both 192.0.2.15",
@@ -200,9 +240,9 @@ func TestValidate(t *testing.T) {
 			wantErr: "addresses.ntp lists 4 addresses; at most 3",
 		},
 		{
-			name:    "no Keycloak address with the bundled Keycloak",
+			name:    "no Keycloak address",
 			mutate:  func(s *Settings) { s.Addresses.Keycloak = "" },
-			wantErr: "addresses.keycloak is required with the bundled Keycloak",
+			wantErr: "addresses.keycloak is required",
 		},
 		{
 			name:    "NICo DNS without an upstream",
@@ -270,26 +310,41 @@ func TestValidate(t *testing.T) {
 			wantErr: "",
 		},
 		{
-			name: "an external identity provider",
+			name:    "no BGP",
+			mutate:  func(s *Settings) { s.BGP = BGP{} },
+			wantErr: "bgp.seed.asn is required: an ASN from 1 to 4294967295\nbgp.seed.peers must list at least one router",
+		},
+		{
+			name:    "a BGP peer without an address or ASN",
+			mutate:  func(s *Settings) { s.BGP.Seed.Peers = append(s.BGP.Seed.Peers, BGPPeer{}) },
+			wantErr: "bgp.seed.peers[1].address is required\nbgp.seed.peers[1].asn is required",
+		},
+		{
+			name:    "a BGP peer address that is not an IP",
+			mutate:  func(s *Settings) { s.BGP.Seed.Peers[0].Address = "router.example.com" },
+			wantErr: `bgp.seed.peers[0].address "router.example.com" is not an IP address`,
+		},
+		{
+			name: "a BGP peer listed twice",
 			mutate: func(s *Settings) {
-				s.Addresses.Keycloak = ""
-				s.OrgID = "example-org"
-				s.Identity.External = &ExternalIdentity{
-					Issuer: "https://idp.example.com/realms/nico", JWKSURL: "https://idp.example.com/certs",
-					TokenURL: "https://idp.example.com/token", ClientID: "nvkectl",
-				}
+				s.BGP.Seed.Peers = append(s.BGP.Seed.Peers, BGPPeer{Address: "10.0.0.1", ASN: 65001})
 			},
+			wantErr: "bgp.seed.peers[1].address 10.0.0.1 is also bgp.seed.peers[0]'s",
+		},
+		{
+			name:    "an iBGP IPv6 peer",
+			mutate:  func(s *Settings) { s.BGP.Seed.Peers[0] = BGPPeer{Address: "2001:db8::1", ASN: s.BGP.Seed.ASN} },
 			wantErr: "",
 		},
 		{
-			name: "an external identity provider with a bad URL and no client or org",
-			mutate: func(s *Settings) {
-				s.Identity.External = &ExternalIdentity{Issuer: "idp.example.com", JWKSURL: "https://idp.example.com/certs", TokenURL: "https://idp.example.com/token"}
-			},
-			wantErr: `orgID is required with identity.external: the org is "ncx" only in the bundled Keycloak` + "\n" +
-				`identity.external.issuer "idp.example.com" must be an http or https URL` + "\n" +
-				"identity.external.clientID is required\n" +
-				"addresses.keycloak must be unset with identity.external",
+			name:    "two SSH public keys",
+			mutate:  func(s *Settings) { s.Allocation.SSHPublicKey += "\n" + exampleKey },
+			wantErr: "allocation.sshPublicKey must be one OpenSSH public key",
+		},
+		{
+			name:    "an SSH public key without a comment",
+			mutate:  func(s *Settings) { s.Allocation.SSHPublicKey = strings.TrimSuffix(exampleKey, " example@nvke") },
+			wantErr: "",
 		},
 		{
 			name:    "an unknown DPU factory model",
@@ -298,61 +353,61 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name:    "no machines",
-			mutate:  func(s *Settings) { s.MachineList = nil },
-			wantErr: "lists no machine",
+			mutate:  func(s *Settings) { s.Machines = nil },
+			wantErr: "machines is required",
 		},
 		{
 			name: "a machine without a name, serial or login",
 			mutate: func(s *Settings) {
-				s.MachineList[0].Name = ""
-				s.MachineList[0].Serial = ""
-				s.MachineList[0].BMCLogin = ""
+				s.Machines[0].Name = ""
+				s.Machines[0].Serial = ""
+				s.Machines[0].BMCLogin = ""
 			},
 			wantErr: "machines[0]: name is required\nmachines[0]: serial is required\nmachines[0]: bmcLogin is required",
 		},
 		{
 			name:    "a login prefix that is not a variable name",
-			mutate:  func(s *Settings) { s.MachineList[0].BMCLogin = "NICO-BMC" },
+			mutate:  func(s *Settings) { s.Machines[0].BMCLogin = "NICO-BMC" },
 			wantErr: `machines[0] (host-a): bmcLogin "NICO-BMC" must be an environment variable name prefix`,
 		},
 		{
 			name:    "a serial NICo refuses",
-			mutate:  func(s *Settings) { s.MachineList[0].Serial = "SN.A" },
+			mutate:  func(s *Settings) { s.Machines[0].Serial = "SN.A" },
 			wantErr: `machines[0] (host-a): serial "SN.A" must be 4 to 64 letters, digits, dashes or underscores`,
 		},
 		{
 			name:    "a duplicate name",
-			mutate:  func(s *Settings) { s.MachineList[1].Name = "host-a" },
+			mutate:  func(s *Settings) { s.Machines[1].Name = "host-a" },
 			wantErr: "machines[1] (host-a): name host-a is also machines[0] (host-a)'s",
 		},
 		{
 			name:    "a duplicate MAC in another spelling",
-			mutate:  func(s *Settings) { s.MachineList[1].BootNICMAC = "02-00-00-00-00-01" },
+			mutate:  func(s *Settings) { s.Machines[1].BootNICMAC = "02-00-00-00-00-01" },
 			wantErr: "machines[1] (host-b): bootNICMAC 02:00:00:00:00:01 is also machines[0] (host-a)'s",
 		},
 		{
 			name:    "a duplicate serial",
-			mutate:  func(s *Settings) { s.MachineList[0].Serial = "DPU-SN-B" },
+			mutate:  func(s *Settings) { s.Machines[0].Serial = "DPU-SN-B" },
 			wantErr: "machines[1] (host-b): dpus[0].serial DPU-SN-B is also machines[0] (host-a)'s",
 		},
 		{
 			name:    "a duplicate IP",
-			mutate:  func(s *Settings) { s.MachineList[0].BMCIP = "10.2.0.20" },
+			mutate:  func(s *Settings) { s.Machines[0].BMCIP = "10.2.0.20" },
 			wantErr: "machines[1] (host-b): dpus[0].bmcIP 10.2.0.20 is also machines[0] (host-a)'s",
 		},
 		{
 			name:    "a malformed MAC",
-			mutate:  func(s *Settings) { s.MachineList[0].BMCMAC = "02:00:00:00:00" },
+			mutate:  func(s *Settings) { s.Machines[0].BMCMAC = "02:00:00:00:00" },
 			wantErr: `machines[0] (host-a): bmcMAC "02:00:00:00:00" is not a MAC address`,
 		},
 		{
 			name:    "an unknown DPU policy",
-			mutate:  func(s *Settings) { s.MachineList[0].DPUPolicy = "nic_mode" },
+			mutate:  func(s *Settings) { s.Machines[0].DPUPolicy = "nic_mode" },
 			wantErr: `machines[0] (host-a): dpuPolicy "nic_mode" is not one of manage, nic, ignore`,
 		},
 		{
 			name:    "a NIC-policy host without a boot NIC",
-			mutate:  func(s *Settings) { s.MachineList[1].BootNICMAC = "" },
+			mutate:  func(s *Settings) { s.Machines[1].BootNICMAC = "" },
 			wantErr: "machines[1] (host-b): bootNICMAC is required with DPU policy nic",
 		},
 		{
@@ -469,7 +524,7 @@ func TestValidate(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Load(fixture(t, nil))
+			s, err := Load(fixture(t), "")
 			require.NoError(t, err)
 			tt.mutate(s)
 			var p problems
@@ -582,7 +637,7 @@ func TestSecretsFromEnv(t *testing.T) {
 		for env, v := range map[string]string{
 			SiteWideBMCRootPasswordEnv: rootPassword, HostUEFIPasswordEnv: "example-host-uefi", DPUUEFIPasswordEnv: "example-dpu-uefi",
 			DPUBMCFactoryUsernameEnv: "", DPUBMCFactoryPasswordEnv: "", RegistryUsernameEnv: "", RegistryPasswordEnv: "",
-			ClientSecretEnv: "", "NICO_BMC_EXAMPLE_USERNAME": "root", "NICO_BMC_EXAMPLE_PASSWORD": bmcPassword,
+			BGPPasswordEnv: "", "NICO_BMC_EXAMPLE_USERNAME": "root", "NICO_BMC_EXAMPLE_PASSWORD": bmcPassword,
 		} {
 			t.Setenv(env, v)
 		}
@@ -615,13 +670,12 @@ func TestSecretsFromEnv(t *testing.T) {
 			wantErr:  []string{"dpuFactoryModels names the DPU models"},
 		},
 		{
-			name:     "an external identity provider without its client secret",
-			settings: func(s *Settings) { s.Identity.External = &ExternalIdentity{} },
-			wantErr:  []string{ClientSecretEnv + " is not set"},
+			name: "the BGP password",
+			env:  map[string]string{BGPPasswordEnv: "example-bgp-password"},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			s, err := Load(fixture(t, nil))
+			s, err := Load(fixture(t), "")
 			require.NoError(t, err)
 			if tt.settings != nil {
 				tt.settings(s)
@@ -644,6 +698,7 @@ func TestSecretsFromEnv(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, rootPassword, got.SiteWideBMCRootPassword)
 			assert.Equal(t, map[string]Login{"NICO_BMC_EXAMPLE": {Username: "root", Password: bmcPassword}}, got.BMCLogins)
+			assert.Equal(t, tt.env[BGPPasswordEnv], got.BGPPassword)
 		})
 	}
 }

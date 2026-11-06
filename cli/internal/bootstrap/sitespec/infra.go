@@ -5,8 +5,11 @@ package sitespec
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -87,6 +90,16 @@ func (inv *SiteSpec) NicoSettingsPath() string {
 		return ""
 	}
 	return inv.ResolvePath(inv.Infra.Nico.Managed.Settings)
+}
+
+// NicoHandoverDir returns the directory NICo's handover bundle is written to,
+// <clusterName>-nico-handover beside the site spec, or "" when the bootstrap
+// installs no NICo.
+func (inv *SiteSpec) NicoHandoverDir() string {
+	if !inv.IsManagedNico() {
+		return ""
+	}
+	return inv.ResolvePath(inv.ClusterName + "-nico-handover")
 }
 
 // NicoRemote is an existing NICo.
@@ -367,13 +380,77 @@ func (v *validator) checkNicoSettings(inv *SiteSpec) {
 	if _, err := os.Stat(path); err != nil {
 		return
 	}
-	settings, err := nicosettings.Load(path)
+	settings, err := nicosettings.Load(path, inv.NicoHandoverDir())
 	if err == nil {
+		v.checkNicoAddressesOffVIP(settings.Addresses, inv.Cluster.ControlPlaneVIP)
+		v.checkNicoSiteSize(settings, inv.ControlPlaneCount())
 		_, err = nicosettings.SecretsFromEnv(settings)
 	}
 	if err != nil {
 		for _, problem := range strings.Split(err.Error(), "\n") {
 			v.addf("%s.settings: %s", pathNicoManaged, problem)
+		}
+	}
+}
+
+// checkNicoSiteSize refuses a control plane larger than the machines the
+// settings list, and more Vault replicas than the site cluster has nodes:
+// Vault's chart runs one replica per node, and the nodes are the control plane.
+func (v *validator) checkNicoSiteSize(settings *nicosettings.Settings, controlPlane int) {
+	if have := len(settings.Machines); have < controlPlane {
+		v.addf("%s.settings: machines lists %d hosts, fewer than the %d %s.count asks for", pathNicoManaged, have, controlPlane, pathNicoControlPlane)
+	}
+	if replicas := settings.EffectiveSiteReplicas(); replicas > controlPlane {
+		v.addf("%s.settings: site.replicas is %d, more than the site cluster's %d nodes (%s.count); set site.replicas to at most %d",
+			pathNicoManaged, replicas, controlPlane, pathNicoControlPlane, controlPlane)
+	}
+}
+
+// SiteStackNodePorts are the node ports the NVKE stack holds on a site
+// cluster the bootstrap builds: the controller's API (controllerdeploy.DefaultCWEPort)
+// and SPIRE's server (controllerdeploy.SPIREServerNodePort).
+var SiteStackNodePorts = []uint16{30080, 30081}
+
+// The node port range of a site cluster's API server.
+const nodePortMin, nodePortMax = 30000, 32767
+
+// checkNicoAddressesOffVIP refuses a NICo service address on the control-plane
+// VIP, which the site's kube-vip announces. Only REST and Keycloak may be
+// there: the site publishes each on the node port its port names, which must
+// be one the site's API server hands out and the NVKE stack does not hold.
+// REST and Keycloak may share an address only there.
+func (v *validator) checkNicoAddressesOffVIP(a nicosettings.Addresses, controlPlaneVIP string) {
+	vip, err := netip.ParseAddr(controlPlaneVIP)
+	if err != nil {
+		return
+	}
+	// Off the VIP each is a LoadBalancer Service with externalTrafficPolicy Local,
+	// so a shared address would send one service's connections to nodes running
+	// only the other's pods.
+	if rest, kc := a.RESTEndpoint().Addr(), a.KeycloakEndpoint().Addr(); rest.IsValid() && rest == kc && rest != vip {
+		v.addf("%s.settings: addresses.rest and addresses.keycloak are both %s: they may share an address only on %s",
+			pathNicoManaged, rest, pathControlPlaneVIP)
+	}
+	named := [][2]string{{"dhcp", a.DHCP}, {"pxe", a.PXE}, {"api", a.API}, {"dns", a.DNS}}
+	for i, ntp := range a.NTP {
+		named = append(named, [2]string{fmt.Sprintf("ntp[%d]", i), ntp})
+	}
+	for _, n := range named {
+		if addr, err := netip.ParseAddr(n[1]); err == nil && addr == vip {
+			v.addf("%s.settings: addresses.%s %s is %s: only addresses.rest and addresses.keycloak may be the control-plane VIP",
+				pathNicoManaged, n[0], n[1], pathControlPlaneVIP)
+		}
+	}
+	for _, ep := range []struct {
+		name    string
+		at      netip.AddrPort
+		example uint16
+	}{{"rest", a.RESTEndpoint(), 30388}, {"keycloak", a.KeycloakEndpoint(), 30082}} {
+		if p := ep.at.Port(); ep.at.Addr() == vip && (p < nodePortMin || p > nodePortMax || slices.Contains(SiteStackNodePorts, p)) {
+			v.addf("%s.settings: addresses.%s %s is on %s, where the site publishes it on a node port: name a port from %d to %d "+
+				"other than %v, such as %s",
+				pathNicoManaged, ep.name, ep.at, pathControlPlaneVIP, nodePortMin, nodePortMax, SiteStackNodePorts,
+				netip.AddrPortFrom(vip, ep.example))
 		}
 	}
 }

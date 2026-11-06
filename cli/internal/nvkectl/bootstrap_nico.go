@@ -62,7 +62,7 @@ func loadManagedNico(inv *sitespec.SiteSpec) (*managedNico, error) {
 		return nil, nil
 	}
 	path := inv.NicoSettingsPath()
-	settings, err := nicosettings.Load(path)
+	settings, err := nicosettings.Load(path, inv.NicoHandoverDir())
 	if err != nil {
 		return nil, fmt.Errorf("NICo settings %s: %w", path, err)
 	}
@@ -72,15 +72,15 @@ func loadManagedNico(inv *sitespec.SiteSpec) (*managedNico, error) {
 	}
 	for _, s := range []string{
 		secrets.SiteWideBMCRootPassword, secrets.HostUEFIPassword, secrets.DPUUEFIPassword,
-		secrets.DPUBMCFactoryPassword, secrets.RegistryPassword, secrets.ClientSecret,
+		secrets.DPUBMCFactoryPassword, secrets.RegistryPassword, secrets.BGPPassword,
 	} {
 		redact.RegisterSecret(s)
 	}
 	for _, login := range secrets.BMCLogins {
 		redact.RegisterSecret(login.Password)
 	}
-	if have, want := len(settings.MachineList), inv.ControlPlaneCount(); have < want {
-		return nil, fmt.Errorf("NICo settings %s: the machines file lists %d machines, fewer than the %d infra.nico.controlPlane.count asks for",
+	if have, want := len(settings.Machines), inv.ControlPlaneCount(); have < want {
+		return nil, fmt.Errorf("NICo settings %s: machines lists %d hosts, fewer than the %d infra.nico.controlPlane.count asks for",
 			path, have, want)
 	}
 	// Vault's chart runs one replica per node, and the site cluster's nodes are its control plane.
@@ -174,8 +174,8 @@ func (n *managedNico) configure(
 	}); err != nil {
 		return fmt.Errorf("ingesting the site's machines into NICo: %w", err)
 	}
-	serials := make([]string, 0, len(n.settings.MachineList))
-	for _, m := range n.settings.MachineList {
+	serials := make([]string, 0, len(n.settings.Machines))
+	for _, m := range n.settings.Machines {
 		serials = append(serials, m.Serial)
 	}
 	res, err := nicoalloc.Ensure(ctx, nicoalloc.Config{
@@ -185,7 +185,7 @@ func (n *managedNico) configure(
 		Serials:           serials,
 		ControlPlaneCount: inv.ControlPlaneCount(),
 		Allocation:        n.settings.Allocation,
-		SSHPublicKey:      n.settings.SSHPublicKeyData,
+		SSHPublicKey:      n.settings.Allocation.SSHPublicKey,
 		Logger:            logger,
 	})
 	if err != nil {

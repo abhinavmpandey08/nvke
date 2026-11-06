@@ -45,9 +45,9 @@ type Config struct {
 	// $oauthtoken, NGC's.
 	RegistryUsername string
 	RegistryPassword string
-	// CoreValues is NICo Core's site configuration, a values file in the format
-	// of NICo's values/nico-core.yaml.
-	CoreValues string
+	// CoreValues are NICo Core's site configuration, values in the format of
+	// NICo's values/nico-core.yaml.
+	CoreValues map[string]any
 	// Settings is the NICo settings file the install follows.
 	Settings *nicosettings.Settings
 	// Secrets are the secrets the settings need.

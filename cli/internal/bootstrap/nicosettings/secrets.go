@@ -7,9 +7,9 @@ import "os"
 
 // SecretsFromEnv reads the secrets s needs from the environment. Required: the
 // site-wide BMC root password, the host and DPU UEFI passwords, each machine's
-// <BMCLogin>_USERNAME and <BMCLogin>_PASSWORD, and, with Identity.External, the
-// client secret. The DPU BMC factory login is optional but set as a pair, and
-// required when DPUFactoryModels is set; the registry login is optional. The
+// <BMCLogin>_USERNAME and <BMCLogin>_PASSWORD. The DPU BMC factory login is
+// optional but set as a pair, and required when DPUFactoryModels is set; the
+// registry login and the BGP password are optional. The
 // error names each missing variable, one per line, and never a value.
 func SecretsFromEnv(s *Settings) (Secrets, error) {
 	sec := Secrets{
@@ -20,8 +20,8 @@ func SecretsFromEnv(s *Settings) (Secrets, error) {
 		DPUBMCFactoryPassword:   os.Getenv(DPUBMCFactoryPasswordEnv),
 		RegistryUsername:        os.Getenv(RegistryUsernameEnv),
 		RegistryPassword:        os.Getenv(RegistryPasswordEnv),
-		ClientSecret:            os.Getenv(ClientSecretEnv),
 		BMCLogins:               map[string]Login{},
+		BGPPassword:             os.Getenv(BGPPasswordEnv),
 	}
 	var p problems
 	for _, r := range []struct{ env, value, why string }{
@@ -38,10 +38,7 @@ func SecretsFromEnv(s *Settings) (Secrets, error) {
 	} else if sec.DPUBMCFactoryUsername == "" && len(s.DPUFactoryModels) > 0 {
 		p.addf("%s and %s must be set: dpuFactoryModels names the DPU models they are for", DPUBMCFactoryUsernameEnv, DPUBMCFactoryPasswordEnv)
 	}
-	if s.Identity.External != nil && sec.ClientSecret == "" {
-		p.addf("%s is not set: it is identity.external's client secret", ClientSecretEnv)
-	}
-	for _, m := range s.MachineList {
+	for _, m := range s.Machines {
 		if _, seen := sec.BMCLogins[m.BMCLogin]; seen || m.BMCLogin == "" {
 			continue
 		}

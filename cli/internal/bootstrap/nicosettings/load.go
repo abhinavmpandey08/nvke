@@ -15,44 +15,30 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Load reads the settings file at path, resolves its relative paths from the file's directory, reads the machines
-// file, the SSH public key and the Core values' site config, and validates all
-// of it. Unknown fields are refused. The error lists every problem, one per line.
-func Load(path string) (*Settings, error) {
+// Load reads the settings file at path, reads the site config from its Core
+// values, and validates all of it. Unknown fields are refused, except inside
+// coreValues. handoverDir is the directory the handover bundle is written to;
+// one that already holds a bundle is refused. The error lists every problem,
+// one per line.
+func Load(path, handoverDir string) (*Settings, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("resolving the NICo settings path: %w", err)
 	}
-	s := &Settings{Path: abs}
+	s := &Settings{Path: abs, HandoverDir: handoverDir}
 	if err := decodeStrict(abs, &s.File); err != nil {
 		return nil, fmt.Errorf("NICo settings %s: %w", abs, err)
 	}
-	dir := filepath.Dir(abs)
-	for _, p := range []*string{&s.CoreValues, &s.Machines, &s.Allocation.SSHPublicKey, &s.HandoverDir} {
-		if *p != "" && !filepath.IsAbs(*p) {
-			*p = filepath.Join(dir, *p)
-		}
-	}
+	// A block scalar leaves a trailing newline on the key.
+	s.Allocation.SSHPublicKey = strings.TrimSpace(s.Allocation.SSHPublicKey)
 
 	var p problems
-	if s.Machines != "" {
-		if err := decodeStrict(s.Machines, &s.MachineList); err != nil {
-			p.addf("machines %s: %v", s.Machines, err)
-		}
-	}
-	if s.Allocation.SSHPublicKey != "" {
-		if key, err := os.ReadFile(s.Allocation.SSHPublicKey); err != nil {
-			p.addf("allocation.sshPublicKey: %v", err)
-		} else if s.SSHPublicKeyData = strings.TrimSpace(string(key)); s.SSHPublicKeyData == "" {
-			p.addf("allocation.sshPublicKey %s is empty", s.Allocation.SSHPublicKey)
-		}
-	}
 	siteConfigRead := false
-	if s.CoreValues != "" {
-		if data, err := os.ReadFile(s.CoreValues); err != nil {
+	if len(s.CoreValues) > 0 {
+		if data, err := yaml.Marshal(s.CoreValues); err != nil {
 			p.addf("coreValues: %v", err)
 		} else if s.SiteConfig, err = ParseSiteConfig(data); err != nil {
-			p.addf("coreValues %s: %v", s.CoreValues, err)
+			p.addf("coreValues: %v", err)
 		} else {
 			siteConfigRead = true
 		}

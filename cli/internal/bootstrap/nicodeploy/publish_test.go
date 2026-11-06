@@ -27,8 +27,8 @@ func TestSeedPortMappings(t *testing.T) {
 		{ContainerPort: 31880, HostPort: 8080, Protocol: "TCP", ListenAddress: "10.0.0.80"},
 		{ContainerPort: 31443, HostPort: 443, Protocol: "TCP", ListenAddress: "10.0.0.43"},
 		{ContainerPort: 31388, HostPort: 8388, Protocol: "TCP", ListenAddress: "10.0.0.88"},
+		{ContainerPort: 31082, HostPort: 8082, Protocol: "TCP", ListenAddress: "10.0.0.82"},
 	}
-	keycloak := engine.PortMapping{ContainerPort: 31082, HostPort: 8082, Protocol: "TCP", ListenAddress: "10.0.0.82"}
 	tests := []struct {
 		name string
 		edit func(*nicosettings.Addresses)
@@ -36,7 +36,7 @@ func TestSeedPortMappings(t *testing.T) {
 	}{
 		{
 			name: "every service NICo serves",
-			want: append(append([]engine.PortMapping{}, base...), keycloak,
+			want: append(append([]engine.PortMapping{}, base...),
 				engine.PortMapping{ContainerPort: 31053, HostPort: 53, Protocol: "UDP", ListenAddress: "10.0.0.53"},
 				engine.PortMapping{ContainerPort: 31053, HostPort: 53, Protocol: "TCP", ListenAddress: "10.0.0.53"},
 				engine.PortMapping{ContainerPort: 31123, HostPort: 123, Protocol: "UDP", ListenAddress: "10.0.0.123"},
@@ -44,9 +44,19 @@ func TestSeedPortMappings(t *testing.T) {
 			),
 		},
 		{
-			name: "the site's DNS and NTP, an external identity provider, and no SSH console on the seed",
-			edit: func(a *nicosettings.Addresses) { a.DNS, a.NTP, a.Keycloak = "", nil, "" },
+			name: "the site's DNS and NTP",
+			edit: func(a *nicosettings.Addresses) { a.DNS, a.NTP = "", nil },
 			want: base,
+		},
+		{
+			name: "REST and Keycloak on one address and their own ports",
+			edit: func(a *nicosettings.Addresses) {
+				a.REST, a.Keycloak, a.DNS, a.NTP = "10.0.0.250:30388", "10.0.0.250:30082", "", nil
+			},
+			want: append(append([]engine.PortMapping{}, base[:4]...),
+				engine.PortMapping{ContainerPort: 31388, HostPort: 30388, Protocol: "TCP", ListenAddress: "10.0.0.250"},
+				engine.PortMapping{ContainerPort: 31082, HostPort: 30082, Protocol: "TCP", ListenAddress: "10.0.0.250"},
+			),
 		},
 	}
 	for _, tt := range tests {
@@ -118,14 +128,4 @@ func TestPublishSeed(t *testing.T) {
 			assert.Equal(t, tt.ports, s.Spec.Ports)
 		})
 	}
-
-	t.Run("an external identity provider publishes no Keycloak", func(t *testing.T) {
-		kube := fake.NewClientset()
-		e := New(nil, kube, slog.New(slog.NewTextHandler(io.Discard, nil)))
-		settings := testSettings()
-		settings.Identity.External = &nicosettings.ExternalIdentity{Issuer: "https://idp.example.com"}
-		require.NoError(t, e.publishSeed(ctx, NewConfig(settings, nicosettings.Secrets{}, ProfileSeed, "standard")))
-		_, err := kube.CoreV1().Services(restNamespace).Get(ctx, "nvkectl-keycloak", metav1.GetOptions{})
-		assert.Error(t, err)
-	})
 }

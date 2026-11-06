@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,15 +65,14 @@ var temporalNamespaces = []string{"cloud", "site"}
 
 // Install installs NICo on the cluster as cfg.Settings describes and returns
 // how it is reached: its prerequisites, with the UEFI passwords, NICo Core, the
-// REST CA, the identity provider (NICo's bundled Keycloak unless the settings
-// name an external one), Temporal, NICo REST, and the site agent of a
+// REST CA, NICo's bundled Keycloak, Temporal, NICo REST, and the site agent of a
 // registered site. With ProfileSeed it publishes every service on its fixed
 // node port once NICo Core is installed. It verifies NICo answers on the
 // settings' addresses before it returns. root is the NICo source Fetch
 // extracted. With ProfileSeed it first installs cert-manager; otherwise the
 // cluster must already run it. Every step is an upgrade or a check, so it can be run again.
 func (e *Engine) Install(ctx context.Context, kubeconfig, root string, cfg Config) (*Installed, error) {
-	if cfg.Settings == nil || cfg.ImageRegistry == "" || cfg.CoreImageTag == "" || cfg.RestImageTag == "" || cfg.CoreValues == "" {
+	if cfg.Settings == nil || cfg.ImageRegistry == "" || cfg.CoreImageTag == "" || cfg.RestImageTag == "" || len(cfg.CoreValues) == 0 {
 		return nil, errors.New("nicodeploy: Settings, ImageRegistry, CoreImageTag, RestImageTag and CoreValues are required")
 	}
 	if cfg.Timeout <= 0 {
@@ -148,8 +146,7 @@ func (e *Engine) installREST(ctx context.Context, kubeconfig, root, tmp string, 
 	return clientCredentials(cfg, login), nil
 }
 
-// installRESTChart installs the nico-rest chart. login is the bundled
-// Keycloak's, nil with an external identity provider.
+// installRESTChart installs the nico-rest chart. login is the bundled Keycloak's.
 func (e *Engine) installRESTChart(ctx context.Context, kubeconfig, root, tmp string, cfg Config, login *keycloakLogin) error {
 	creds, err := e.waitSecret(ctx, restNamespace, restDBCreds, cfg.Timeout)
 	if err != nil {
@@ -166,15 +163,15 @@ func (e *Engine) installRESTChart(ctx context.Context, kubeconfig, root, tmp str
 		return err
 	}
 	if cfg.Profile == ProfileSite {
-		return e.applyLoadBalancer(ctx, restNamespace, "nico-rest-api", cfg.Settings.Addresses.REST, 8388)
+		return e.applyLoadBalancer(ctx, restNamespace, "nico-rest-api", cfg.Settings.Addresses.RESTEndpoint().Addr().String(), 8388)
 	}
 	return nil
 }
 
 // restOverrides is what NICo REST takes beyond NICo's values: the images and
 // their pull credentials, the database login, the replicas, Temporal's address
-// in its own namespace, and the identity provider whose tokens it accepts.
-// login is the bundled Keycloak's, nil with an external identity provider.
+// in its own namespace, and the bundled Keycloak whose tokens it accepts, with
+// login its secrets.
 func restOverrides(cfg Config, dbUser, dbPassword string, login *keycloakLogin) map[string]any {
 	secrets := map[string]any{"dbCreds": map[string]any{"username": dbUser, "password": dbPassword}}
 	if cfg.RegistryPassword != "" {
@@ -182,21 +179,9 @@ func restOverrides(cfg Config, dbUser, dbPassword string, login *keycloakLogin) 
 	}
 	temporal := map[string]any{"host": temporalHost}
 	apiConfig := map[string]any{"temporal": temporal}
-	if ext := cfg.Settings.Identity.External; ext != nil {
-		apiConfig["keycloak"] = map[string]any{"enabled": false}
-		// A service-account mapping gives the client's tokens both admin roles in
-		// the org, as the bundled realm does for ncx-service.
-		apiConfig["issuers"] = []map[string]any{{
-			"name": "external", "origin": "custom", "issuer": ext.Issuer, "jwks": ext.JWKSURL,
-			"claimMappings": []map[string]any{{
-				"orgName": cfg.Settings.EffectiveOrgID(), "orgDisplayName": cfg.Settings.EffectiveOrgID(), "isServiceAccount": true,
-			}},
-		}}
-	} else {
-		// Tokens carry the issuer they were fetched from, which is the published address, not the in-cluster one.
-		apiConfig["keycloak"] = map[string]any{"enabled": true, "externalBaseURL": keycloakBaseURL(cfg.Settings), "serviceAccount": true}
-		secrets["keycloakClientSecret"] = map[string]any{"value": login.RESTSecret}
-	}
+	// Tokens carry the issuer they were fetched from, which is the published address, not the in-cluster one.
+	apiConfig["keycloak"] = map[string]any{"enabled": true, "externalBaseURL": keycloakBaseURL(cfg.Settings), "serviceAccount": true}
+	secrets["keycloakClientSecret"] = map[string]any{"value": login.RESTSecret}
 	return map[string]any{
 		"global":           map[string]any{"image": map[string]any{"repository": cfg.ImageRegistry, "tag": cfg.RestImageTag}},
 		"nico-rest-common": map[string]any{"secrets": secrets},
@@ -215,21 +200,17 @@ func restOverrides(cfg Config, dbUser, dbPassword string, login *keycloakLogin) 
 
 // restEndpoint is NICo REST's base URL at its published address.
 func restEndpoint(s *nicosettings.Settings) string {
-	return "http://" + net.JoinHostPort(s.Addresses.REST, "8388")
+	return "http://" + s.Addresses.RESTEndpoint().String()
 }
 
 // keycloakBaseURL is the bundled Keycloak's base URL at its published address.
 func keycloakBaseURL(s *nicosettings.Settings) string {
-	return "http://" + net.JoinHostPort(s.Addresses.Keycloak, "8082")
+	return "http://" + s.Addresses.KeycloakEndpoint().String()
 }
 
 // clientCredentials is the OAuth2 client nvkectl and CAPNICo fetch tokens
-// with: the external identity provider's, or the bundled realm's service
-// account. login is nil with an external identity provider.
+// with: the bundled realm's service account.
 func clientCredentials(cfg Config, login *keycloakLogin) nicorest.ClientCredentials {
-	if ext := cfg.Settings.Identity.External; ext != nil {
-		return nicorest.ClientCredentials{TokenURL: ext.TokenURL, ClientID: ext.ClientID, ClientSecret: cfg.Secrets.ClientSecret}
-	}
 	return nicorest.ClientCredentials{
 		TokenURL:     keycloakBaseURL(cfg.Settings) + "/realms/" + keycloakRealm + "/protocol/openid-connect/token",
 		ClientID:     serviceClientID,
@@ -354,12 +335,8 @@ type keycloakLogin struct {
 
 // installKeycloak runs NICo's development Keycloak against its database in
 // NICo's Postgres, with generated secrets in place of its defaults, and
-// returns them. With an external identity provider it installs nothing and
-// returns nil.
+// returns them.
 func (e *Engine) installKeycloak(ctx context.Context, kubeconfig, root, tmp string, cfg Config) (*keycloakLogin, error) {
-	if cfg.Settings.Identity.External != nil {
-		return nil, nil
-	}
 	login, err := e.ensureKeycloakLogin(ctx)
 	if err != nil {
 		return nil, err
@@ -403,7 +380,7 @@ func (e *Engine) installKeycloak(ctx context.Context, kubeconfig, root, tmp stri
 		return nil, err
 	}
 	if cfg.Profile == ProfileSite {
-		if err := e.applyLoadBalancer(ctx, restNamespace, "keycloak", cfg.Settings.Addresses.Keycloak, 8082); err != nil {
+		if err := e.applyLoadBalancer(ctx, restNamespace, "keycloak", cfg.Settings.Addresses.KeycloakEndpoint().Addr().String(), 8082); err != nil {
 			return nil, err
 		}
 	}

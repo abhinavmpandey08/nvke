@@ -4,14 +4,16 @@
 package nicosettings
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"golang.org/x/crypto/ssh"
 )
 
 var (
@@ -43,8 +45,6 @@ const (
 func (s *Settings) validate(p *problems, siteConfigRead bool) {
 	for _, f := range []struct{ name, value string }{
 		{"apiHostname", s.APIHostname},
-		{"coreValues", s.CoreValues},
-		{"machines", s.Machines},
 		{"images.registry", s.Images.Registry},
 		{"images.coreTag", s.Images.CoreTag},
 		{"images.restTag", s.Images.RestTag},
@@ -54,14 +54,17 @@ func (s *Settings) validate(p *problems, siteConfigRead bool) {
 		{"addresses.pxe", s.Addresses.PXE},
 		{"addresses.api", s.Addresses.API},
 		{"addresses.rest", s.Addresses.REST},
+		{"addresses.keycloak", s.Addresses.Keycloak},
 		{"site.storageClass", s.Site.StorageClass},
 		{"allocation.vpcType", s.Allocation.VPCType},
 		{"allocation.sshPublicKey", s.Allocation.SSHPublicKey},
-		{"handoverDir", s.HandoverDir},
 	} {
 		if f.value == "" {
 			p.addf("%s is required", f.name)
 		}
+	}
+	if len(s.CoreValues) == 0 {
+		p.addf("coreValues is required: it holds NICo Core's values and the site config")
 	}
 	if h := s.APIHostname; h != "" && (len(h) > 253 || !hostnameRE.MatchString(h)) {
 		p.addf("apiHostname %q must be a lowercase DNS name", h)
@@ -71,7 +74,7 @@ func (s *Settings) validate(p *problems, siteConfigRead bool) {
 	}
 	if s.HandoverDir != "" {
 		if _, err := os.Stat(filepath.Join(s.HandoverDir, HandoverVaultKeysFile)); err == nil {
-			p.addf("handoverDir %s already holds a handover bundle: move it away or name another directory", s.HandoverDir)
+			p.addf("the handover directory %s already holds a handover bundle: move it away", s.HandoverDir)
 		}
 	}
 	for _, m := range s.DPUFactoryModels {
@@ -79,8 +82,8 @@ func (s *Settings) validate(p *problems, siteConfigRead bool) {
 			p.addf("dpuFactoryModels: %q is not one of bf2, bf3, bf4, unknown", m)
 		}
 	}
-	s.validateIdentity(p)
 	s.validateAddresses(p)
+	s.validateBGP(p)
 	s.validateImages(p)
 	s.validateMachines(p)
 	if siteConfigRead {
@@ -89,39 +92,11 @@ func (s *Settings) validate(p *problems, siteConfigRead bool) {
 	s.validateAllocation(p)
 }
 
-// validateIdentity checks the external identity provider, when one is set.
-func (s *Settings) validateIdentity(p *problems) {
-	ext := s.Identity.External
-	if ext == nil {
-		return
-	}
-	if s.OrgID == "" {
-		p.addf("orgID is required with identity.external: the org is %q only in the bundled Keycloak", DefaultOrgID)
-	}
-	for _, u := range []struct{ name, value string }{
-		{"identity.external.issuer", ext.Issuer},
-		{"identity.external.jwksURL", ext.JWKSURL},
-		{"identity.external.tokenURL", ext.TokenURL},
-	} {
-		if parsed, err := url.Parse(u.value); err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-			p.addf("%s %q must be an http or https URL", u.name, u.value)
-		}
-	}
-	if ext.ClientID == "" {
-		p.addf("identity.external.clientID is required")
-	}
-}
-
 // validateAddresses checks the service addresses: each a valid address, IPv4
-// where NICo hands it out over DHCPv4, and no two services on one address.
+// where NICo hands it out over DHCPv4, and no two services on one address,
+// except REST and Keycloak on different ports.
 func (s *Settings) validateAddresses(p *problems) {
 	a := s.Addresses
-	if s.Identity.External == nil && a.Keycloak == "" {
-		p.addf("addresses.keycloak is required with the bundled Keycloak: it is the token endpoint")
-	}
-	if s.Identity.External != nil && a.Keycloak != "" {
-		p.addf("addresses.keycloak must be unset with identity.external: no Keycloak is installed")
-	}
 	if len(a.NTP) > maxNTPAddresses {
 		p.addf("addresses.ntp lists %d addresses; at most %d are supported", len(a.NTP), maxNTPAddresses)
 	}
@@ -139,40 +114,91 @@ func (s *Settings) validateAddresses(p *problems) {
 		}
 	}
 
+	// port is the default port of a service published as "ip" or "ip:port"; 0 for an IP address alone.
 	type service struct {
 		name, value string
 		ipv4        bool
+		port        uint16
 	}
 	services := []service{
-		{"addresses.dhcp", a.DHCP, true},
-		{"addresses.pxe", a.PXE, true},
-		{"addresses.api", a.API, false},
-		{"addresses.rest", a.REST, false},
-		{"addresses.keycloak", a.Keycloak, false},
-		{"addresses.dns", a.DNS, true},
-		{"addresses.sshConsole", a.SSHConsole, false},
+		{"addresses.dhcp", a.DHCP, true, 0},
+		{"addresses.pxe", a.PXE, true, 0},
+		{"addresses.api", a.API, false, 0},
+		{"addresses.rest", a.REST, false, DefaultRESTPort},
+		{"addresses.keycloak", a.Keycloak, false, DefaultKeycloakPort},
+		{"addresses.dns", a.DNS, true, 0},
 	}
 	for i, ntp := range a.NTP {
-		services = append(services, service{fmt.Sprintf("addresses.ntp[%d]", i), ntp, true})
+		services = append(services, service{fmt.Sprintf("addresses.ntp[%d]", i), ntp, true, 0})
 	}
-	owner := map[netip.Addr]string{}
+	owner := map[netip.Addr]service{}
 	for _, svc := range services {
 		if svc.value == "" {
 			continue
 		}
-		addr, err := netip.ParseAddr(svc.value)
-		switch {
-		case err != nil:
-			p.addf("%s %q is not an IP address", svc.name, svc.value)
-			continue
-		case svc.ipv4 && !addr.Is4():
+		var addr netip.Addr
+		if svc.port != 0 {
+			ap, err := parseEndpoint(svc.value, svc.port)
+			if err != nil {
+				p.addf("%s %v", svc.name, err)
+				continue
+			}
+			addr, svc.port = ap.Addr(), ap.Port()
+		} else {
+			var err error
+			if addr, err = netip.ParseAddr(svc.value); err != nil {
+				p.addf("%s %q is not an IP address", svc.name, svc.value)
+				continue
+			}
+		}
+		if svc.ipv4 && !addr.Is4() {
 			p.addf("%s %q must be an IPv4 address: NICo hands it out over DHCPv4", svc.name, svc.value)
 		}
 		if other, taken := owner[addr]; taken {
-			p.addf("%s and %s are both %s: each service needs its own address", other, svc.name, addr)
+			// REST and Keycloak may share an address on different ports.
+			switch {
+			case other.port == 0 || svc.port == 0:
+				p.addf("%s and %s are both %s: each service needs its own address", other.name, svc.name, addr)
+			case other.port == svc.port:
+				p.addf("%s and %s are both %s: services that share an address need different ports",
+					other.name, svc.name, netip.AddrPortFrom(addr, svc.port))
+			}
 			continue
 		}
-		owner[addr] = svc.name
+		owner[addr] = svc
+	}
+}
+
+// validateBGP checks the seed's BGP speaker: an ASN and at least one router,
+// each router with an IP address, listed once, and an ASN.
+func (s *Settings) validateBGP(p *problems) {
+	const at = "bgp.seed"
+	sp := s.BGP.Seed
+	if sp.ASN == 0 {
+		p.addf("%s.asn is required: an ASN from 1 to 4294967295", at)
+	}
+	if len(sp.Peers) == 0 {
+		p.addf("%s.peers must list at least one router", at)
+	}
+	seen := map[netip.Addr]string{}
+	for i, peer := range sp.Peers {
+		peerAt := fmt.Sprintf("%s.peers[%d]", at, i)
+		addr, err := netip.ParseAddr(peer.Address)
+		switch {
+		case peer.Address == "":
+			p.addf("%s.address is required", peerAt)
+		case err != nil:
+			p.addf("%s.address %q is not an IP address", peerAt, peer.Address)
+		default:
+			if other, taken := seen[addr]; taken {
+				p.addf("%s.address %s is also %s's: each router is listed once", peerAt, addr, other)
+			} else {
+				seen[addr] = peerAt
+			}
+		}
+		if peer.ASN == 0 {
+			p.addf("%s.asn is required: an ASN from 1 to 4294967295", peerAt)
+		}
 	}
 }
 
@@ -197,11 +223,11 @@ func (s *Settings) validateImages(p *problems) {
 	}
 }
 
-// validateMachines checks the machines file: every host named, its BMC MAC,
-// serial and login set, and no name, MAC, serial or IP address used twice.
+// validateMachines checks the machines: at least one, every host named, its
+// BMC MAC, serial and login set, and no name, MAC, serial or IP address used twice.
 func (s *Settings) validateMachines(p *problems) {
-	if s.Machines != "" && len(s.MachineList) == 0 {
-		p.addf("machines %s lists no machine", s.Machines)
+	if len(s.Machines) == 0 {
+		p.addf("machines is required: it lists the site's hosts")
 	}
 	names, macs, serials, ips := map[string]string{}, map[string]string{}, map[string]string{}, map[string]string{}
 	// unique records value under kind for the machine at; the first holder keeps it.
@@ -237,7 +263,7 @@ func (s *Settings) validateMachines(p *problems) {
 		}
 		unique(ips, field, addr.String(), at)
 	}
-	for i, m := range s.MachineList {
+	for i, m := range s.Machines {
 		at := fmt.Sprintf("machines[%d]", i)
 		if m.Name == "" {
 			p.addf("%s: name is required", at)
@@ -343,7 +369,7 @@ func (s *Settings) validateSiteConfig(p *problems) {
 		}
 	}
 	var managed, nicOrIgnore bool
-	for _, m := range s.MachineList {
+	for _, m := range s.Machines {
 		if s.dpuPolicy(m) == DPUPolicyManage {
 			managed = true
 		} else {
@@ -438,6 +464,9 @@ func (s *Settings) validateAllocation(p *problems) {
 	default:
 		p.addf("allocation.vpcType %q is not one of %s, %s", al.VPCType, VPCTypeEthernetVirtualizer, VPCTypeFNN)
 	}
+	if al.SSHPublicKey != "" && !isSSHPublicKey(al.SSHPublicKey) {
+		p.addf("allocation.sshPublicKey must be one OpenSSH public key: <type> <base64> [comment]")
+	}
 	if al.SubnetPrefixLength < minSubnetPrefixLength || al.SubnetPrefixLength > maxSubnetPrefixLength {
 		p.addf("allocation.subnetPrefixLength %d must be from %d to %d", al.SubnetPrefixLength, minSubnetPrefixLength, maxSubnetPrefixLength)
 	}
@@ -461,4 +490,19 @@ func (s *Settings) validateAllocation(p *problems) {
 		p.addf("allocation.tenantBlockPrefixLength %d is shorter than the largest site fabric prefix, /%d, so no fabric prefix holds the tenant block",
 			al.TenantBlockPrefixLength, shortest)
 	}
+}
+
+// isSSHPublicKey reports whether key is one OpenSSH public key on one line:
+// its type, the base64 key of that type, and an optional comment.
+func isSSHPublicKey(key string) bool {
+	f := strings.Fields(key)
+	if len(f) < 2 || strings.Contains(key, "\n") {
+		return false
+	}
+	blob, err := base64.StdEncoding.DecodeString(f[1])
+	if err != nil {
+		return false
+	}
+	parsed, err := ssh.ParsePublicKey(blob)
+	return err == nil && parsed.Type() == f[0]
 }

@@ -26,7 +26,7 @@ func testSettings() *nicosettings.Settings {
 		},
 		Addresses: nicosettings.Addresses{
 			DHCP: "10.0.0.67", PXE: "10.0.0.80", API: "10.0.0.43", REST: "10.0.0.88", Keycloak: "10.0.0.82",
-			DNS: "10.0.0.53", NTP: []string{"10.0.0.123", "10.0.0.124"}, SSHConsole: "10.0.0.22",
+			DNS: "10.0.0.53", NTP: []string{"10.0.0.123", "10.0.0.124"},
 		},
 		UpstreamDNS: []string{"1.1.1.1", "8.8.8.8"},
 		UpstreamNTP: []string{"ntp.example.com"},
@@ -67,8 +67,7 @@ func TestCoreOverrides(t *testing.T) {
 			profile: ProfileSite,
 			check: func(t *testing.T, v map[string]any) {
 				for chart, ip := range map[string]string{
-					"nico-api": "10.0.0.43", "nico-dhcp": "10.0.0.67", "nico-pxe": "10.0.0.80",
-					"nico-ssh-console-rs": "10.0.0.22", "unbound": "10.0.0.53",
+					"nico-api": "10.0.0.43", "nico-dhcp": "10.0.0.67", "nico-pxe": "10.0.0.80", "unbound": "10.0.0.53",
 				} {
 					assert.Equal(t, true, at(v, chart, "externalService", "enabled"), chart)
 					assert.Equal(t, ip, at(v, chart, "externalService", "annotations", lbIPsAnnotation), chart)
@@ -82,9 +81,8 @@ func TestCoreOverrides(t *testing.T) {
 			},
 		},
 		{
-			name:    "site without an SSH console address keeps it inside",
+			name:    "site keeps the SSH console inside",
 			profile: ProfileSite,
-			edit:    func(s *nicosettings.Settings) { s.Addresses.SSHConsole = "" },
 			check: func(t *testing.T, v map[string]any) {
 				assert.Equal(t, false, at(v, "nico-ssh-console-rs", "externalService", "enabled"))
 			},

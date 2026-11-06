@@ -1327,16 +1327,24 @@ func TestValidateBootstrapReferences_ManagedNicoNeedsNoCredentialsFile(t *testin
 // loaded, and each problem with them or with the secrets they need from the
 // environment is reported against infra.nico.managed.settings.
 func TestValidateBootstrapReferences_ManagedNicoSettings(t *testing.T) {
-	settings, err := filepath.Abs(filepath.Join("..", "nicosettings", "testdata", "settings.yaml"))
+	settings, err := filepath.Abs(filepath.Join("..", "nicosettings", "testdata", "nico.yaml"))
 	require.NoError(t, err)
+	// The settings list two machines, so the control plane and Vault have two each.
+	data, err := os.ReadFile(settings)
+	require.NoError(t, err)
+	const site = "  storageClass: example-storage\n"
+	require.Contains(t, string(data), site)
+	data = []byte(strings.Replace(string(data), site, site+"  replicas: 2\n", 1))
 	newSpec := func(t *testing.T) *SiteSpec {
 		dir := t.TempDir()
 		writeNicoFiles(t, dir, "unused.token", "releases")
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "nico.yaml"), data, 0o600))
 		inv := minimalValid()
 		inv.Cluster.Nodes = nil
 		inv.Infra.Provider = ProviderNico
 		inv.Infra.Nico = managedNico()
-		inv.Infra.Nico.Managed.Settings = settings
+		inv.Infra.Nico.ControlPlane.Count = 2
+		inv.Infra.Nico.Managed.Settings = "nico.yaml"
 		inv.dir = dir
 		return inv
 	}
@@ -1355,7 +1363,7 @@ func TestValidateBootstrapReferences_ManagedNicoSettings(t *testing.T) {
 	t.Run("valid settings with their secrets", func(t *testing.T) {
 		setSecrets(t)
 		inv := newSpec(t)
-		assert.Equal(t, settings, inv.NicoSettingsPath())
+		assert.Equal(t, filepath.Join(inv.dir, "nico.yaml"), inv.NicoSettingsPath())
 		assert.NoError(t, inv.ValidateBootstrapReferences())
 	})
 	t.Run("http without the opt-in", func(t *testing.T) {
@@ -1366,12 +1374,81 @@ func TestValidateBootstrapReferences_ManagedNicoSettings(t *testing.T) {
 		assert.Contains(t, err.Error(), "infra.nico.managed: the NICo the bootstrap installs serves its REST API")
 		assert.Contains(t, err.Error(), NicoInsecureEndpointEnv+"=1")
 	})
+	t.Run("more control-plane machines than the settings list", func(t *testing.T) {
+		setSecrets(t)
+		inv := newSpec(t)
+		inv.Infra.Nico.ControlPlane.Count = 3
+		err := inv.ValidateBootstrapReferences()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "infra.nico.managed.settings: machines lists 2 hosts, fewer than the 3 infra.nico.controlPlane.count asks for")
+	})
+	t.Run("more Vault replicas than the site cluster has nodes", func(t *testing.T) {
+		setSecrets(t)
+		inv := newSpec(t)
+		inv.Infra.Nico.ControlPlane.Count = 1
+		err := inv.ValidateBootstrapReferences()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "infra.nico.managed.settings: site.replicas is 2, more than the site cluster's 1 nodes")
+	})
 	t.Run("a missing secret", func(t *testing.T) {
 		setSecrets(t)
 		t.Setenv(nicosettings.SiteWideBMCRootPasswordEnv, "")
 		err := newSpec(t).ValidateBootstrapReferences()
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "infra.nico.managed.settings: "+nicosettings.SiteWideBMCRootPasswordEnv+" is not set")
+	})
+	// withAddress points inv at a copy of the settings with one address replaced.
+	withAddress := func(t *testing.T, inv *SiteSpec, from, to string) {
+		require.Contains(t, string(data), from)
+		require.NoError(t, os.WriteFile(inv.NicoSettingsPath(), []byte(strings.Replace(string(data), from, to, 1)), 0o600))
+	}
+	for name, tt := range map[string]struct {
+		vip, from, to string
+		wantErr       string
+	}{
+		"REST on the control-plane VIP on a node port": {vip: "192.0.2.13", from: "rest: 192.0.2.13", to: "rest: 192.0.2.13:30388"},
+		"REST on the control-plane VIP on its default port": {
+			vip: "192.0.2.13",
+			wantErr: "infra.nico.managed.settings: addresses.rest 192.0.2.13:8388 is on cluster.controlPlaneVIP, where the site publishes it " +
+				"on a node port: name a port from 30000 to 32767 other than [30080 30081], such as 192.0.2.13:30388",
+		},
+		"REST and Keycloak sharing the control-plane VIP": {
+			vip: "192.0.2.13", from: "rest: 192.0.2.13\n  keycloak: 192.0.2.14", to: "rest: 192.0.2.13:30388\n  keycloak: 192.0.2.13:30082",
+		},
+		"REST and Keycloak sharing an address off the control-plane VIP": {
+			vip: "192.0.2.99", from: "rest: 192.0.2.13\n  keycloak: 192.0.2.14", to: "rest: 192.0.2.13:8388\n  keycloak: 192.0.2.13:8082",
+			wantErr: "infra.nico.managed.settings: addresses.rest and addresses.keycloak are both 192.0.2.13: " +
+				"they may share an address only on cluster.controlPlaneVIP",
+		},
+		"Keycloak on the control-plane VIP on the controller's node port": {
+			vip: "192.0.2.14", from: "keycloak: 192.0.2.14", to: "keycloak: 192.0.2.14:30080",
+			wantErr: "addresses.keycloak 192.0.2.14:30080 is on cluster.controlPlaneVIP",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			setSecrets(t)
+			inv := newSpec(t)
+			inv.Cluster.ControlPlaneVIP = tt.vip
+			if tt.from != "" {
+				withAddress(t, inv, tt.from, tt.to)
+			}
+			err := inv.ValidateBootstrapReferences()
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+	t.Run("another service on the control-plane VIP", func(t *testing.T) {
+		setSecrets(t)
+		inv := newSpec(t)
+		inv.Cluster.ControlPlaneVIP = "192.0.2.17"
+		err := inv.ValidateBootstrapReferences()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "infra.nico.managed.settings: addresses.ntp[1] 192.0.2.17 is cluster.controlPlaneVIP: "+
+			"only addresses.rest and addresses.keycloak may be the control-plane VIP")
 	})
 }
 
@@ -1385,6 +1462,8 @@ func TestNicoSettingsPath(t *testing.T) {
 	inv.Infra.Nico = managedNico()
 	inv.dir = "/srv/site"
 	assert.Equal(t, "/srv/site/nico-settings.yaml", inv.NicoSettingsPath())
+	inv.ClusterName = "site-a"
+	assert.Equal(t, "/srv/site/site-a-nico-handover", inv.NicoHandoverDir())
 }
 
 // TestLoad_RejectsTheNicoTenantBlock: the node login is a credential, so it is

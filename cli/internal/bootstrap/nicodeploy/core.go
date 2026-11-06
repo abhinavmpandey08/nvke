@@ -31,13 +31,17 @@ func (e *Engine) installCore(ctx context.Context, kubeconfig, root, tmp string, 
 			return err
 		}
 	}
+	coreValues := filepath.Join(tmp, "core-values.yaml")
+	if err := writeValues(coreValues, cfg.CoreValues); err != nil {
+		return err
+	}
 	values := filepath.Join(tmp, "nico-core.yaml")
 	if err := writeValues(values, coreOverrides(cfg)); err != nil {
 		return err
 	}
-	// The operator's file is NICo's own site configuration; the overrides come last so they win.
+	// The operator's values are NICo's own site configuration; the overrides come last so they win.
 	return e.helm(ctx, kubeconfig, "nico", nicoNamespace, []string{filepath.Join(root, "helm")},
-		[]string{filepath.Join(root, "helm-prereqs", "values", "nico-core.yaml"), cfg.CoreValues, values}, cfg.Timeout)
+		[]string{filepath.Join(root, "helm-prereqs", "values", "nico-core.yaml"), coreValues, values}, cfg.Timeout)
 }
 
 // coreOverrides is what NICo Core takes beyond NICo's values and the
@@ -92,7 +96,7 @@ func coreOverrides(cfg Config) map[string]any {
 			"bootArtifactContainers": boot,
 			"externalService":        externalService(site, a.PXE, true),
 		},
-		"nico-ssh-console-rs":        map[string]any{"externalService": externalService(site, a.SSHConsole, false)},
+		"nico-ssh-console-rs":        map[string]any{"externalService": map[string]any{"enabled": false}},
 		"nico-dns":                   map[string]any{"enabled": false},
 		"nico-flow":                  map[string]any{"enabled": false},
 		"nico-dsx-exchange-consumer": map[string]any{"enabled": false},

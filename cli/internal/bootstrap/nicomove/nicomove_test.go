@@ -126,10 +126,7 @@ func testMover(t *testing.T, failOn string, before, after nicodeploy.SiteState) 
 		require.NoError(t, os.WriteFile(p, []byte(name), 0o644))
 		return p
 	}
-	settings := &nicosettings.Settings{
-		File: nicosettings.File{CoreValues: write("core.yaml"), Machines: write("machines.yaml"), HandoverDir: filepath.Join(t.TempDir(), "handover")},
-		Path: write("nico.yaml"),
-	}
+	settings := &nicosettings.Settings{Path: write("nico.yaml"), HandoverDir: filepath.Join(t.TempDir(), "handover")}
 	two := int32(2)
 	siteKube := fake.NewClientset(&appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Namespace: capnicoNamespace, Name: capnicoDeployment},
@@ -195,7 +192,7 @@ func TestRunOrder(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
 	for _, f := range []string{
 		"databases/nico_system_nico.dump", "databases/nico_rest.dump", "databases/keycloak.dump", "vault.snap",
-		"inputs/settings.yaml", "inputs/machines.yaml", "inputs/core-values.yaml", "helm-values/nico.yaml",
+		"inputs/settings.yaml", "helm-values/nico.yaml",
 		"versions.yaml", "vault-keys.json", "site-root.crt", "site-root.key", "rest-ca.crt", "rest-ca.key", "keycloak-admin.yaml",
 	} {
 		info, err := os.Stat(filepath.Join(dir, f))

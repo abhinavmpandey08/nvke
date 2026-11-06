@@ -171,23 +171,19 @@ func managedNicoSiteSpec(t *testing.T, count int) string {
 	t.Helper()
 	path := nicoSiteSpecFile(t)
 	dir := filepath.Dir(path)
-	for _, name := range []string{"settings.yaml", "machines.yaml", "nico-core.yaml", "id.pub"} {
-		data, err := os.ReadFile(filepath.Join("../bootstrap/nicosettings/testdata", name))
-		require.NoError(t, err)
-		if name == "settings.yaml" {
-			// The site cluster's nodes are its control plane, each running one Vault replica.
-			data = []byte(strings.Replace(string(data), "  storageClass: example-storage\n",
-				"  storageClass: example-storage\n  replicas: "+strconv.Itoa(count)+"\n", 1))
-		}
-		require.NoError(t, os.WriteFile(filepath.Join(dir, name), data, 0o600))
-	}
+	data, err := os.ReadFile(filepath.Join("../bootstrap/nicosettings/testdata", "nico.yaml"))
+	require.NoError(t, err)
+	// The site cluster's nodes are its control plane, each running one Vault replica.
+	data = []byte(strings.Replace(string(data), "  storageClass: example-storage\n",
+		"  storageClass: example-storage\n  replicas: "+strconv.Itoa(count)+"\n", 1))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "nico.yaml"), data, 0o600))
 	example, err := os.ReadFile(path)
 	require.NoError(t, err)
 	text := string(example)
 	remote := "    remote:\n      endpoint: \"https://nico.example\"\n      siteID: \"00000000-0000-0000-0000-000000000001\"\n" +
 		"      vpcID: \"00000000-0000-0000-0000-000000000002\"\n"
 	require.Contains(t, text, remote, "the example's remote block changed; update this test")
-	text = strings.Replace(text, remote, "    managed:\n      settings: settings.yaml\n", 1)
+	text = strings.Replace(text, remote, "    managed:\n      settings: nico.yaml\n", 1)
 	require.Contains(t, text, "      count: 3\n", "the example's control-plane count changed; update this test")
 	text = strings.Replace(text, "      count: 3\n", "      count: "+strconv.Itoa(count)+"\n", 1)
 	require.NoError(t, os.WriteFile(path, []byte(text), 0o600))
@@ -213,11 +209,11 @@ func TestRunBootstrapSiteDryRunLoadsManagedNico(t *testing.T) {
 	})
 	t.Run("more control-plane machines than the machines file lists", func(t *testing.T) {
 		err := runBootstrapSite(context.Background(), io.Discard, &bootstrapSiteOptions{siteSpec: managedNicoSiteSpec(t, 3), dryRun: true})
-		require.ErrorContains(t, err, "lists 2 machines, fewer than the 3")
+		require.ErrorContains(t, err, "machines lists 2 hosts, fewer than the 3")
 	})
 	t.Run("more Vault replicas than the site cluster has nodes", func(t *testing.T) {
 		path := managedNicoSiteSpec(t, 1)
-		settings := filepath.Join(filepath.Dir(path), "settings.yaml")
+		settings := filepath.Join(filepath.Dir(path), "nico.yaml")
 		data, err := os.ReadFile(settings)
 		require.NoError(t, err)
 		require.NoError(t, os.WriteFile(settings, []byte(strings.Replace(string(data), "  replicas: 1\n", "  replicas: 3\n", 1)), 0o600))
@@ -237,7 +233,7 @@ func TestRunBootstrapSiteDryRunLoadsManagedNico(t *testing.T) {
 func TestManagedNicoAddresses(t *testing.T) {
 	n := &managedNico{settings: &nicosettings.Settings{File: nicosettings.File{Addresses: nicosettings.Addresses{
 		DHCP: "192.0.2.10", PXE: "192.0.2.11", API: "192.0.2.12", REST: "192.0.2.13", Keycloak: "192.0.2.14",
-		NTP: []string{"192.0.2.16", "192.0.2.17"}, SSHConsole: "192.0.2.19",
+		NTP: []string{"192.0.2.16", "192.0.2.17"},
 	}}}}
 	assert.ElementsMatch(t, []string{"192.0.2.10", "192.0.2.11", "192.0.2.12", "192.0.2.13", "192.0.2.14", "192.0.2.16", "192.0.2.17"}, n.addresses())
 }

@@ -42,7 +42,7 @@ type machine struct {
 func waitReady(ctx context.Context, cfg Config, log *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
-	hosts := cfg.Settings.MachineList
+	hosts := cfg.Settings.Machines
 	last := ""
 	for {
 		var state string

@@ -127,7 +127,7 @@ func register(ctx context.Context, cfg Config, cli *adminCLI, log *slog.Logger) 
 	}
 	log.Info("NICo has the site-wide BMC credentials")
 
-	for _, m := range cfg.Settings.MachineList {
+	for _, m := range cfg.Settings.Machines {
 		login, ok := s.BMCLogins[m.BMCLogin]
 		if !ok {
 			return fmt.Errorf("nicoingest: machine %s has no BMC login: set %s_USERNAME and %s_PASSWORD", m.Name, m.BMCLogin, m.BMCLogin)
@@ -183,9 +183,6 @@ func expectedMachineArgs(m nicosettings.Machine, login nicosettings.Login) []str
 	}
 	if m.BMCIP != "" {
 		args = append(args, "--bmc-ip-address="+m.BMCIP)
-	}
-	if m.SKU != "" {
-		args = append(args, "--sku-id="+m.SKU)
 	}
 	var ifaces []expectedInterface
 	if m.BootNICMAC != "" {

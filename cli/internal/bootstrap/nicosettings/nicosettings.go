@@ -7,6 +7,11 @@
 // names it. Secrets are not in it; they come from the environment.
 package nicosettings
 
+import (
+	"fmt"
+	"net/netip"
+)
+
 // Environment variables the secrets are read from.
 const (
 	// SiteWideBMCRootPasswordEnv holds the password NICo sets on every BMC it ingests.
@@ -22,8 +27,9 @@ const (
 	// Optional: without a password the images are pulled anonymously.
 	RegistryUsernameEnv = "NVKECTL_NICO_REGISTRY_USERNAME"
 	RegistryPasswordEnv = "NVKECTL_NICO_REGISTRY_PASSWORD"
-	// ClientSecretEnv holds Identity.External's client secret.
-	ClientSecretEnv = "NVKECTL_NICO_CLIENT_SECRET"
+	// BGPPasswordEnv holds the TCP MD5 password of the seed's BGP sessions.
+	// Optional: without it the sessions are unauthenticated.
+	BGPPasswordEnv = "NVKECTL_NICO_BGP_PASSWORD"
 )
 
 // Values Allocation.VPCType takes.
@@ -42,6 +48,12 @@ const (
 // DefaultOrgID is the org NICo's bundled Keycloak realm defines.
 const DefaultOrgID = "ncx"
 
+// Ports addresses.rest and addresses.keycloak take when they name none.
+const (
+	DefaultRESTPort     = 8388
+	DefaultKeycloakPort = 8082
+)
+
 // DefaultSiteReplicas is how many replicas NICo's stateful services run on the site cluster.
 const DefaultSiteReplicas = 3
 
@@ -49,22 +61,23 @@ const DefaultSiteReplicas = 3
 // and root token. A handover directory that holds it already holds a bundle.
 const HandoverVaultKeysFile = "vault-keys.json"
 
-// File is the NICo settings file. Relative paths in it resolve from the file's
-// own directory.
+// File is the NICo settings file infra.nico.managed.settings names. Unknown
+// fields are refused, except inside CoreValues.
 type File struct {
-	// OrgID is the NICo org the site's objects are created in. Optional with the
-	// bundled Keycloak, where it defaults to DefaultOrgID.
+	// OrgID is the NICo org the site's objects are created in. Optional;
+	// DefaultOrgID, the bundled Keycloak's, when unset.
 	OrgID string `yaml:"orgID,omitempty"`
 	// APIHostname is the NICo API's host name, put on its certificate. Required.
 	APIHostname string `yaml:"apiHostname"`
-	// CoreValues is a NICo Core values file in the format of NICo's
-	// helm-prereqs/values/nico-core.yaml. Its nico-api.siteConfig.nicoApiSiteConfig
+	// CoreValues are NICo Core's Helm values, in the format of NICo's
+	// helm-prereqs/values/nico-core.yaml. They go over NICo's own values, and
+	// nvkectl's overrides go over them. Its nico-api.siteConfig.nicoApiSiteConfig
 	// TOML is the site config: the site's name in NICo, DNS domain, network segments, resource pools,
 	// tenant address space, blocked ranges, DHCP and NTP servers, default DPU
 	// policy, attestation and validation settings. Required.
-	CoreValues string `yaml:"coreValues"`
-	// Machines is the machines file. Required.
-	Machines string `yaml:"machines"`
+	CoreValues map[string]any `yaml:"coreValues"`
+	// Machines are the site's hosts. Required.
+	Machines []Machine `yaml:"machines"`
 	// Images are NICo's images.
 	Images Images `yaml:"images"`
 	// Addresses are the fixed addresses NICo's services are published on, the
@@ -79,14 +92,11 @@ type File struct {
 	Site SiteProfile `yaml:"site"`
 	// Allocation is what the control-plane machines are allocated with.
 	Allocation Allocation `yaml:"allocation"`
-	// Identity is the identity provider NICo's REST API trusts.
-	Identity Identity `yaml:"identity,omitempty"`
 	// DPUFactoryModels are the DPU models the DPU BMC factory login is set for,
 	// when DPUBMCFactoryUsernameEnv is set.
 	DPUFactoryModels []string `yaml:"dpuFactoryModels,omitempty"`
-	// HandoverDir is the directory the handover bundle is written to. Required,
-	// and must not hold a bundle already.
-	HandoverDir string `yaml:"handoverDir"`
+	// BGP is how the service addresses are routed to NICo. Required.
+	BGP BGP `yaml:"bgp"`
 }
 
 // Images are NICo's images. Their tags must be builds of the NICo release
@@ -112,21 +122,47 @@ type Images struct {
 
 // Addresses are the fixed IP addresses NICo's services are published on.
 type Addresses struct {
-	// DHCP (udp/67), PXE (tcp/80, 8080), API (tcp/443) and REST (tcp/8388) are required.
+	// DHCP (udp/67), PXE (tcp/80, 8080) and API (tcp/443) are required.
 	DHCP string `yaml:"dhcp"`
 	PXE  string `yaml:"pxe"`
 	API  string `yaml:"api"`
+	// REST is NICo REST, "ip" or "ip:port" ("[ip]:port" for IPv6), on
+	// DefaultRESTPort when it names none. Required. It may be the site's
+	// control-plane VIP, and Keycloak's address on another port.
 	REST string `yaml:"rest"`
-	// Keycloak is the token endpoint (tcp/8082). Required with the bundled Keycloak.
-	Keycloak string `yaml:"keycloak,omitempty"`
+	// Keycloak is the bundled Keycloak's token endpoint, as REST is, on
+	// DefaultKeycloakPort when it names none. Required.
+	Keycloak string `yaml:"keycloak"`
 	// DNS is NICo's .forge resolver (udp and tcp/53). Empty when the site's DNS
 	// serves the .forge names.
 	DNS string `yaml:"dns,omitempty"`
 	// NTP are NICo's NTP servers (udp/123), one per replica. Empty when the
 	// site's NTP is used.
 	NTP []string `yaml:"ntp,omitempty"`
-	// SSHConsole is NICo's SSH console (tcp/22). Optional; published on the site cluster only.
-	SSHConsole string `yaml:"sshConsole,omitempty"`
+}
+
+// BGP is how the bootstrap host announces each service address as a /32
+// until NICo moves to the site cluster.
+type BGP struct {
+	// Seed is the bootstrap host's BGP speaker. Required.
+	Seed BGPSpeaker `yaml:"seed"`
+}
+
+// BGPSpeaker is a speaker's ASN and the routers it announces to. Every session
+// uses the speaker's own address, and BGPPasswordEnv as its password when set.
+type BGPSpeaker struct {
+	// ASN is the speaker's autonomous system number. Required.
+	ASN uint32 `yaml:"asn"`
+	// Peers are the routers the speaker announces to. At least one is required.
+	Peers []BGPPeer `yaml:"peers"`
+}
+
+// BGPPeer is a router a speaker peers with.
+type BGPPeer struct {
+	// Address is the router's IP address. Required.
+	Address string `yaml:"address"`
+	// ASN is the router's autonomous system number: the speaker's own for iBGP. Required.
+	ASN uint32 `yaml:"asn"`
 }
 
 // SiteProfile is how NICo runs on the site cluster.
@@ -149,26 +185,11 @@ type Allocation struct {
 	// SubnetPrefixLength is the prefix length of the control-plane subnet or
 	// VPC prefix cut from the tenant block. Required.
 	SubnetPrefixLength int `yaml:"subnetPrefixLength"`
-	// SSHPublicKey is a file holding the SSH public key put on the control-plane machines. Required.
+	// SSHPublicKey is the OpenSSH public key put on the control-plane machines. Required.
 	SSHPublicKey string `yaml:"sshPublicKey"`
 }
 
-// Identity is the identity provider NICo's REST API trusts. Without External
-// the bootstrap installs NICo's bundled Keycloak.
-type Identity struct {
-	External *ExternalIdentity `yaml:"external,omitempty"`
-}
-
-// ExternalIdentity is an OIDC provider outside NICo. Its client secret comes
-// from ClientSecretEnv.
-type ExternalIdentity struct {
-	Issuer   string `yaml:"issuer"`
-	JWKSURL  string `yaml:"jwksURL"`
-	TokenURL string `yaml:"tokenURL"`
-	ClientID string `yaml:"clientID"`
-}
-
-// Machine is one host in the machines file.
+// Machine is one of the site's hosts.
 type Machine struct {
 	// Name is how the bootstrap refers to the host. Required, unique.
 	Name string `yaml:"name"`
@@ -192,11 +213,9 @@ type Machine struct {
 	BootNICIP  string `yaml:"bootNICIP,omitempty"`
 	// DPUs are fixed addresses, or serials the host does not report, of the host's DPUs.
 	DPUs []DPU `yaml:"dpus,omitempty"`
-	// SKU is the host's SKU, with strict BOM validation.
-	SKU string `yaml:"sku,omitempty"`
 }
 
-// DPU is what the machines file may say about one of a host's DPUs. Every field is optional.
+// DPU is what the settings may say about one of a host's DPUs. Every field is optional.
 type DPU struct {
 	Serial string `yaml:"serial,omitempty"`
 	BMCMAC string `yaml:"bmcMAC,omitempty"`
@@ -214,9 +233,10 @@ type Secrets struct {
 	DPUBMCFactoryPassword   string
 	RegistryUsername        string
 	RegistryPassword        string
-	ClientSecret            string
 	// BMCLogins maps each machine's BMCLogin prefix to its username and password.
 	BMCLogins map[string]Login
+	// BGPPassword is the TCP MD5 password of every BGP session; empty for none.
+	BGPPassword string
 }
 
 // Login is a username and password.
@@ -275,17 +295,43 @@ type PoolRange struct {
 	End   string `toml:"end"`
 }
 
-// Settings is a loaded, validated settings file with its paths resolved.
+// Settings is a loaded, validated settings file.
 type Settings struct {
 	File
 	// Path is the settings file's own path.
 	Path string
-	// Machines are the machines file's hosts.
-	MachineList []Machine
 	// SiteConfig is read from CoreValues.
 	SiteConfig SiteConfig
-	// SSHPublicKeyData is the content of Allocation.SSHPublicKey.
-	SSHPublicKeyData string
+	// HandoverDir is the directory the handover bundle is written to.
+	HandoverDir string
+}
+
+// RESTEndpoint returns REST's address and port. It is the zero AddrPort when
+// REST does not parse, which Load refuses.
+func (a Addresses) RESTEndpoint() netip.AddrPort {
+	ap, _ := parseEndpoint(a.REST, DefaultRESTPort)
+	return ap
+}
+
+// KeycloakEndpoint returns Keycloak's address and port, as RESTEndpoint does REST's.
+func (a Addresses) KeycloakEndpoint() netip.AddrPort {
+	ap, _ := parseEndpoint(a.Keycloak, DefaultKeycloakPort)
+	return ap
+}
+
+// parseEndpoint parses "ip" or "ip:port" ("[ip]:port" for IPv6), with port when v names none.
+func parseEndpoint(v string, port uint16) (netip.AddrPort, error) {
+	if addr, err := netip.ParseAddr(v); err == nil {
+		return netip.AddrPortFrom(addr, port), nil
+	}
+	ap, err := netip.ParseAddrPort(v)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("%q is not an IP address or IP:port", v)
+	}
+	if ap.Port() == 0 {
+		return netip.AddrPort{}, fmt.Errorf("%q has port 0", v)
+	}
+	return ap, nil
 }
 
 // EffectiveOrgID returns OrgID, or DefaultOrgID when it is unset.

@@ -2570,3 +2570,9 @@ func TestEnsureDefaultStorageClass(t *testing.T) {
 		})
 	}
 }
+
+// TestSiteStackNodePorts: the node ports sitespec keeps NICo's REST and
+// Keycloak off on the control-plane VIP are the ones the stack publishes.
+func TestSiteStackNodePorts(t *testing.T) {
+	assert.ElementsMatch(t, []uint16{uint16(DefaultCWEPort), uint16(SPIREServerNodePort)}, sitespec.SiteStackNodePorts)
+}

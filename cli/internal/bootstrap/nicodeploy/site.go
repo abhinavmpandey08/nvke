@@ -71,8 +71,7 @@ type Carried struct {
 	// when there is none.
 	SSHHostKey *corev1.Secret
 	// KeycloakLogin is the bundled Keycloak's admin password and client secrets
-	// (nico-rest/keycloak-login), which its database already holds. Nil with an
-	// external identity provider.
+	// (nico-rest/keycloak-login), which its database already holds.
 	KeycloakLogin *corev1.Secret
 }
 
@@ -87,7 +86,7 @@ func (e *Engine) ReadCarried(ctx context.Context) (Carried, error) {
 		{&c.SiteRoot, certManagerNS, siteRootSecret, false},
 		{&c.RESTCA, restNamespace, restCASecret, false},
 		{&c.SSHHostKey, nicoNamespace, sshHostKeySecret, true},
-		{&c.KeycloakLogin, restNamespace, keycloakLoginSecret, true},
+		{&c.KeycloakLogin, restNamespace, keycloakLoginSecret, false},
 	} {
 		secret, err := e.kube.CoreV1().Secrets(s.namespace).Get(ctx, s.name, metav1.GetOptions{})
 		switch {
@@ -222,7 +221,8 @@ func metalLBPool(a nicosettings.Addresses) ([]byte, error) {
 // serviceAddresses lists each address NICo's services are published on once.
 func serviceAddresses(a nicosettings.Addresses) []string {
 	var out []string
-	for _, address := range append([]string{a.DHCP, a.PXE, a.API, a.REST, a.Keycloak, a.DNS, a.SSHConsole}, a.NTP...) {
+	rest, keycloak := a.RESTEndpoint().Addr().String(), a.KeycloakEndpoint().Addr().String()
+	for _, address := range append([]string{a.DHCP, a.PXE, a.API, rest, keycloak, a.DNS}, a.NTP...) {
 		if address != "" && !slices.Contains(out, address) {
 			out = append(out, address)
 		}
@@ -246,9 +246,7 @@ func (e *Engine) applyCarried(ctx context.Context, c Carried) error {
 		}
 		secrets = append(secrets, carry(c.SSHHostKey, nicoNamespace, helmLabels, helmAnnotations))
 	}
-	if c.KeycloakLogin != nil {
-		secrets = append(secrets, carry(c.KeycloakLogin, restNamespace, nil, nil))
-	}
+	secrets = append(secrets, carry(c.KeycloakLogin, restNamespace, nil, nil))
 	for _, ns := range []string{certManagerNS, restNamespace} {
 		if err := e.ensureNamespace(ctx, ns, nil, nil); err != nil {
 			return err
@@ -642,7 +640,7 @@ func parseSiteState(out, siteID string) (SiteState, error) {
 // starts REST's crons in the site's Temporal, verifies NICo answers on its
 // addresses, and returns how it is reached.
 func (e *Engine) StartSite(ctx context.Context, kubeconfig, root string, cfg Config, siteID string) (*Installed, error) {
-	if cfg.Settings == nil || cfg.ImageRegistry == "" || cfg.CoreImageTag == "" || cfg.RestImageTag == "" || cfg.CoreValues == "" {
+	if cfg.Settings == nil || cfg.ImageRegistry == "" || cfg.CoreImageTag == "" || cfg.RestImageTag == "" || len(cfg.CoreValues) == 0 {
 		return nil, errors.New("nicodeploy: Settings, ImageRegistry, CoreImageTag, RestImageTag and CoreValues are required")
 	}
 	if _, err := uuid.Parse(siteID); err != nil {

@@ -136,22 +136,14 @@ func TestUnsealVault(t *testing.T) {
 
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-// restTestConfig is a seed Config for the site site-a with the bundled
-// Keycloak, or the external identity provider when external is set.
-func restTestConfig(external bool) Config {
+// restTestConfig is a seed Config for the site site-a.
+func restTestConfig() Config {
 	s := &nicosettings.Settings{File: nicosettings.File{
 		Addresses: nicosettings.Addresses{REST: "10.0.0.88", Keycloak: "10.0.0.82"},
 	}}
-	if external {
-		s.OrgID = "acme"
-		s.Identity.External = &nicosettings.ExternalIdentity{
-			Issuer: "https://idp.example.com", JWKSURL: "https://idp.example.com/jwks",
-			TokenURL: "https://idp.example.com/token", ClientID: "nvkectl",
-		}
-	}
 	return Config{
 		SiteName: "site-a", Replicas: 1, Timeout: time.Second, ImageRegistry: "nvcr.io/example", RestImageTag: "v2.2.2",
-		Settings: s, Secrets: nicosettings.Secrets{HostUEFIPassword: "host-uefi", DPUUEFIPassword: "dpu-uefi", ClientSecret: "example-secret"},
+		Settings: s, Secrets: nicosettings.Secrets{HostUEFIPassword: "host-uefi", DPUUEFIPassword: "dpu-uefi"},
 	}
 }
 
@@ -176,7 +168,7 @@ func TestInitVaultKeepsTheKeysWhenTheyCannotBeStored(t *testing.T) {
 	e := New(&fakeVault{unseals: map[string]int{}}, kube, discardLog())
 	e.poll = time.Millisecond
 	dir := filepath.Join(t.TempDir(), "handover")
-	cfg := Config{Timeout: 20 * time.Millisecond, Settings: &nicosettings.Settings{File: nicosettings.File{HandoverDir: dir}}}
+	cfg := Config{Timeout: 20 * time.Millisecond, Settings: &nicosettings.Settings{HandoverDir: dir}}
 
 	err := e.initVault(context.Background(), "kubeconfig", "vault-0", cfg)
 	require.Error(t, err)
@@ -238,7 +230,7 @@ func TestKVSeeds(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := restTestConfig(false)
+			cfg := restTestConfig()
 			cfg.Secrets.DPUBMCFactoryUsername = tt.factory
 			cfg.Settings.DPUFactoryModels = tt.models
 			seeds, mount, err := kvSeeds(path, cfg)
@@ -256,7 +248,7 @@ func TestKVSeeds(t *testing.T) {
 	}
 
 	require.NoError(t, os.WriteFile(path, []byte("vault:\n  kvSeeds: []\n"), 0o600))
-	_, _, err := kvSeeds(path, restTestConfig(false))
+	_, _, err := kvSeeds(path, restTestConfig())
 	assert.ErrorContains(t, err, "vault.kvMount")
 }
 
@@ -291,10 +283,9 @@ func TestSeedUEFIPasswords(t *testing.T) {
 func TestRestOverrides(t *testing.T) {
 	login := &keycloakLogin{AdminPassword: "a", ServiceSecret: "s", RESTSecret: "r"}
 	tests := []struct {
-		name     string
-		external bool
-		login    *keycloakLogin
-		check    func(t *testing.T, v map[string]any)
+		name  string
+		login *keycloakLogin
+		check func(t *testing.T, v map[string]any)
 	}{
 		{
 			name:  "bundled Keycloak issues tokens at its published address",
@@ -306,22 +297,10 @@ func TestRestOverrides(t *testing.T) {
 				assert.Equal(t, "r", valueAt(v, "nico-rest-common", "secrets", "keycloakClientSecret", "value"))
 			},
 		},
-		{
-			name:     "an external identity provider replaces Keycloak with a service-account issuer",
-			external: true,
-			check: func(t *testing.T, v map[string]any) {
-				assert.Equal(t, map[string]any{"enabled": false}, valueAt(v, "nico-rest-api", "config", "keycloak"))
-				assert.Equal(t, []map[string]any{{
-					"name": "external", "origin": "custom", "issuer": "https://idp.example.com", "jwks": "https://idp.example.com/jwks",
-					"claimMappings": []map[string]any{{"orgName": "acme", "orgDisplayName": "acme", "isServiceAccount": true}},
-				}}, valueAt(v, "nico-rest-api", "config", "issuers"))
-				assert.Nil(t, valueAt(v, "nico-rest-common", "secrets", "keycloakClientSecret"))
-			},
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			v := restOverrides(restTestConfig(tt.external), "nico-rest.nico", "db-password", tt.login)
+			v := restOverrides(restTestConfig(), "nico-rest.nico", "db-password", tt.login)
 			assert.Equal(t, map[string]any{"enabled": false}, valueAt(v, "nico-rest-api", "nodePort"), "Kind maps nvkectl's node port, not the chart's")
 			assert.Equal(t, temporalHost, valueAt(v, "nico-rest-api", "config", "temporal", "host"))
 			assert.Equal(t, "db-password", valueAt(v, "nico-rest-common", "secrets", "dbCreds", "password"))
@@ -335,15 +314,17 @@ func TestClientCredentials(t *testing.T) {
 	login := &keycloakLogin{ServiceSecret: "service-secret"}
 	assert.Equal(t, nicorest.ClientCredentials{
 		TokenURL: "http://10.0.0.82:8082/realms/nico/protocol/openid-connect/token", ClientID: "ncx-service", ClientSecret: "service-secret",
-	}, clientCredentials(restTestConfig(false), login))
-	assert.Equal(t, nicorest.ClientCredentials{
-		TokenURL: "https://idp.example.com/token", ClientID: "nvkectl", ClientSecret: "example-secret",
-	}, clientCredentials(restTestConfig(true), nil))
-	assert.Equal(t, "http://10.0.0.88:8388", restEndpoint(restTestConfig(false).Settings))
+	}, clientCredentials(restTestConfig(), login))
+	assert.Equal(t, "http://10.0.0.88:8388", restEndpoint(restTestConfig().Settings))
+
+	cfg := restTestConfig()
+	cfg.Settings.Addresses.REST, cfg.Settings.Addresses.Keycloak = "10.0.0.250:30388", "[fd00::82]:30082"
+	assert.Equal(t, "http://10.0.0.250:30388", restEndpoint(cfg.Settings))
+	assert.Equal(t, "http://[fd00::82]:30082/realms/nico/protocol/openid-connect/token", clientCredentials(cfg, login).TokenURL)
 }
 
 func TestSiteAgentValues(t *testing.T) {
-	v := siteAgentValues(restTestConfig(false), "0b4f6d3c-1111-4222-8333-444455556666")
+	v := siteAgentValues(restTestConfig(), "0b4f6d3c-1111-4222-8333-444455556666")
 	assert.Equal(t, map[string]any{
 		"CLUSTER_ID":                   "0b4f6d3c-1111-4222-8333-444455556666",
 		"TEMPORAL_SUBSCRIBE_NAMESPACE": "0b4f6d3c-1111-4222-8333-444455556666",
@@ -403,7 +384,7 @@ func TestResolveSiteID(t *testing.T) {
 			e := New(runner, kube, discardLog())
 			e.poll = time.Millisecond
 
-			id, err := e.resolveSiteID(context.Background(), "kubeconfig", restTestConfig(false), tt.given, tt.prior)
+			id, err := e.resolveSiteID(context.Background(), "kubeconfig", restTestConfig(), tt.given, tt.prior)
 			if tt.wantErr {
 				require.Error(t, err)
 				return
@@ -424,7 +405,7 @@ func TestResolveSiteID(t *testing.T) {
 }
 
 func TestRegisterSiteRefusesNamesUnsafeInSQL(t *testing.T) {
-	cfg := restTestConfig(false)
+	cfg := restTestConfig()
 	cfg.SiteName = "site'; DROP TABLE site; --"
 	e := New(&sqlRunner{}, fake.NewClientset(), discardLog())
 	_, err := e.RegisterSite(context.Background(), "kubeconfig", "root", t.TempDir(), cfg, "")

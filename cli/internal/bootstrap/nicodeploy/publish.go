@@ -45,26 +45,21 @@ type seedPort struct {
 }
 
 // seedPorts lists the ports published for addresses a, from the selectors and
-// target ports of the charts' own external Services. keycloak adds the
-// bundled Keycloak's token endpoint.
-func seedPorts(a nicosettings.Addresses, keycloak bool) []seedPort {
+// target ports of the charts' own external Services.
+func seedPorts(a nicosettings.Addresses) []seedPort {
 	dhcp := map[string]string{"app.kubernetes.io/name": "nico-dhcp", "app.kubernetes.io/component": "dhcp"}
 	pxe := map[string]string{"app.kubernetes.io/name": "nico-pxe", "app.kubernetes.io/component": "pxe"}
 	api := map[string]string{"app.kubernetes.io/name": "nico-api", "app.kubernetes.io/component": "api"}
 	rest := map[string]string{"app": "nico-rest-api", "app.kubernetes.io/name": "nico-rest-api", "app.kubernetes.io/component": "api"}
+	keycloak := map[string]string{"app": "keycloak"}
+	rp, kp := a.RESTEndpoint(), a.KeycloakEndpoint()
 	ports := []seedPort{
 		{nicoNamespace, "nvkectl-nico-dhcp", dhcp, 67, dhcpNodePort, intstr.FromInt32(67), corev1.ProtocolUDP, a.DHCP},
 		{nicoNamespace, "nvkectl-nico-pxe", pxe, 80, pxeNodePort, intstr.FromInt32(8080), corev1.ProtocolTCP, a.PXE},
 		{nicoNamespace, "nvkectl-nico-pxe", pxe, 8080, pxeAltNodePort, intstr.FromInt32(8080), corev1.ProtocolTCP, a.PXE},
 		{nicoNamespace, "nvkectl-nico-api", api, 443, apiNodePort, intstr.FromInt32(1079), corev1.ProtocolTCP, a.API},
-		{restNamespace, "nvkectl-nico-rest-api", rest, 8388, restNodePort, intstr.FromInt32(8388), corev1.ProtocolTCP, a.REST},
-	}
-	if keycloak {
-		ports = append(ports, seedPort{
-			restNamespace, "nvkectl-keycloak",
-			map[string]string{"app": "keycloak"},
-			8082, keycloakNodePort, intstr.FromInt32(8080), corev1.ProtocolTCP, a.Keycloak,
-		})
+		{restNamespace, "nvkectl-nico-rest-api", rest, int32(rp.Port()), restNodePort, intstr.FromInt32(8388), corev1.ProtocolTCP, rp.Addr().String()},
+		{restNamespace, "nvkectl-keycloak", keycloak, int32(kp.Port()), keycloakNodePort, intstr.FromInt32(8080), corev1.ProtocolTCP, kp.Addr().String()},
 	}
 	if a.DNS != "" {
 		unbound := map[string]string{
@@ -93,7 +88,7 @@ func seedPorts(a nicosettings.Addresses, keycloak bool) []seedPort {
 // bootstrap cluster's NICo listens on.
 func SeedPortMappings(a nicosettings.Addresses) []engine.PortMapping {
 	var mappings []engine.PortMapping
-	for _, p := range seedPorts(a, a.Keycloak != "") {
+	for _, p := range seedPorts(a) {
 		mappings = append(mappings, engine.PortMapping{
 			ContainerPort: p.nodePort,
 			HostPort:      p.port,
@@ -113,7 +108,7 @@ func (e *Engine) publishSeed(ctx context.Context, cfg Config) error {
 	}
 	var services []*corev1.Service
 	byName := map[string]*corev1.Service{}
-	for _, p := range seedPorts(cfg.Settings.Addresses, cfg.Settings.Identity.External == nil) {
+	for _, p := range seedPorts(cfg.Settings.Addresses) {
 		s := byName[p.namespace+"/"+p.service]
 		if s == nil {
 			s = &corev1.Service{
