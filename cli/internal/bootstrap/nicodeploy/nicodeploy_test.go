@@ -638,30 +638,6 @@ func TestWaitSiteAgentConnected(t *testing.T) {
 	}
 }
 
-func TestApplyLoadBalancer(t *testing.T) {
-	ctx := context.Background()
-	kube := fake.NewClientset(&corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Namespace: restNamespace, Name: "nico-rest-api"},
-		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"app": "nico-rest-api"},
-			Ports:    []corev1.ServicePort{{Name: "http", Port: 8388}, {Name: "metrics", Port: 9360}},
-		},
-	})
-	e := New(&sqlRunner{}, kube, discardLog())
-
-	require.NoError(t, e.applyLoadBalancer(ctx, restNamespace, "nico-rest-api", "10.0.0.88", 8388))
-	require.NoError(t, e.applyLoadBalancer(ctx, restNamespace, "nico-rest-api", "10.0.0.89", 8388), "a rerun updates the Service")
-
-	svc, err := kube.CoreV1().Services(restNamespace).Get(ctx, "nico-rest-api-external", metav1.GetOptions{})
-	require.NoError(t, err)
-	assert.Equal(t, corev1.ServiceTypeLoadBalancer, svc.Spec.Type)
-	assert.Equal(t, map[string]string{"app": "nico-rest-api"}, svc.Spec.Selector)
-	assert.Equal(t, []corev1.ServicePort{{Name: "http", Port: 8388}}, svc.Spec.Ports, "only the published port")
-	assert.Equal(t, "10.0.0.89", svc.Annotations["metallb.universe.tf/loadBalancerIPs"])
-
-	assert.Error(t, e.applyLoadBalancer(ctx, restNamespace, "nico-rest-api", "10.0.0.88", 1234))
-}
-
 // recordingRunner records each command and answers it with answer, when set.
 type recordingRunner struct {
 	mu     sync.Mutex

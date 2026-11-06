@@ -33,8 +33,6 @@ const (
 	ComponentVault            = "vault"
 	ComponentExternalSecrets  = "external-secrets"
 	ComponentCertManager      = "cert-manager"
-	// ComponentMetalLB publishes NICo's services on the site cluster.
-	ComponentMetalLB = "metallb"
 	// ComponentFRR is the BGP speaker that announces NICo's service addresses
 	// from the bootstrap host, and ImageFRR its image's key.
 	ComponentFRR = "frr"

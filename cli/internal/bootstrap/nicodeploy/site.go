@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -22,21 +21,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	sigsyaml "sigs.k8s.io/yaml"
 
-	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/manifest"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicorest"
-	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
 )
 
 // What moving NICo to the site cluster touches beyond its install.
 const (
 	siteRootSecret = "site-root"
-
-	metallbRelease   = "metallb"
-	metallbNamespace = "metallb-system"
-	// metallbPool holds NICo's service addresses and nothing else.
-	metallbPool = "nico-services"
 
 	restAPIDeployment     = "nico-rest-api"
 	cloudWorkerDeployment = "nico-rest-cloud-worker"
@@ -101,9 +92,8 @@ func (e *Engine) ReadCarried(ctx context.Context) (Carried, error) {
 }
 
 // PrepareSite readies the site cluster for the bootstrap cluster's NICo, as
-// cfg describes it with ProfileSite: MetalLB holding every service address,
-// the carried Secrets, the prerequisites on the carried site root CA, and
-// Temporal with the cloud, site and siteID namespaces. It starts nothing that
+// cfg describes it with ProfileSite: the carried Secrets, the prerequisites
+// on the carried site root CA, and Temporal with the cloud, site and siteID namespaces. It starts nothing that
 // writes NICo's databases. root is the NICo source Fetch extracted. The
 // cluster must already run cert-manager.
 func (e *Engine) PrepareSite(ctx context.Context, kubeconfig, root string, cfg Config, carried Carried, siteID string) error {
@@ -126,9 +116,6 @@ func (e *Engine) PrepareSite(ctx context.Context, kubeconfig, root string, cfg C
 	}
 	defer func() { _ = os.RemoveAll(tmp) }()
 
-	if err := e.installMetalLB(ctx, kubeconfig, tmp, cfg); err != nil {
-		return err
-	}
 	if err := e.applyCarried(ctx, carried); err != nil {
 		return err
 	}
@@ -146,88 +133,6 @@ func (e *Engine) PrepareSite(ctx context.Context, kubeconfig, root string, cfg C
 	}
 	e.log.Info("the site cluster is ready for NICo", "site", cfg.SiteName)
 	return nil
-}
-
-// installMetalLB installs MetalLB with a pool of NICo's service addresses,
-// announced on the site's layer 2 network. The pool assigns an address only
-// to a Service that names it.
-func (e *Engine) installMetalLB(ctx context.Context, kubeconfig, tmp string, cfg Config) error {
-	values := filepath.Join(tmp, "metallb.yaml")
-	if err := writeValues(values, map[string]any{"speaker": map[string]any{
-		// kubeadm marks control-plane nodes excluded from load balancers, and the site's nodes may all be control planes.
-		"ignoreExcludeLB": true,
-		"frr":             map[string]any{"enabled": false},
-	}}); err != nil {
-		return err
-	}
-	if err := e.helm(ctx, kubeconfig, metallbRelease, metallbNamespace, chartRef(manifest.Load(), manifest.ComponentMetalLB),
-		[]string{values}, cfg.Timeout); err != nil {
-		return err
-	}
-	pool, err := metalLBPool(cfg.Settings.Addresses)
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(tmp, "metallb-pool.yaml")
-	if err := os.WriteFile(path, pool, 0o600); err != nil {
-		return err
-	}
-	// MetalLB's webhook refuses the pool until its certificate is in place.
-	return e.until(ctx, cfg.Timeout, "MetalLB to take NICo's address pool", func(ctx context.Context) (bool, error) {
-		_, err := e.kubectl(ctx, kubeconfig, "apply", "-f", path)
-		if err != nil {
-			e.log.Warn("applying MetalLB's address pool failed; retrying", "err", err)
-		}
-		return err == nil, nil
-	})
-}
-
-// metalLBPool is the IPAddressPool of every address in a and the
-// L2Advertisement that announces it.
-func metalLBPool(a nicosettings.Addresses) ([]byte, error) {
-	var cidrs []string
-	for _, address := range serviceAddresses(a) {
-		ip := net.ParseIP(address)
-		if ip == nil {
-			return nil, fmt.Errorf("nicodeploy: the service address %q is not an IP address", address)
-		}
-		bits := "/128"
-		if ip.To4() != nil {
-			bits = "/32"
-		}
-		cidrs = append(cidrs, ip.String()+bits)
-	}
-	meta := map[string]any{"name": metallbPool, "namespace": metallbNamespace}
-	var docs []string
-	for _, obj := range []map[string]any{
-		{
-			"apiVersion": "metallb.io/v1beta1", "kind": "IPAddressPool", "metadata": meta,
-			"spec": map[string]any{"addresses": cidrs, "autoAssign": false},
-		},
-		{
-			"apiVersion": "metallb.io/v1beta1", "kind": "L2Advertisement", "metadata": meta,
-			"spec": map[string]any{"ipAddressPools": []string{metallbPool}},
-		},
-	} {
-		b, err := sigsyaml.Marshal(obj)
-		if err != nil {
-			return nil, err
-		}
-		docs = append(docs, string(b))
-	}
-	return []byte(strings.Join(docs, "---\n")), nil
-}
-
-// serviceAddresses lists each address NICo's services are published on once.
-func serviceAddresses(a nicosettings.Addresses) []string {
-	var out []string
-	rest, keycloak := a.RESTEndpoint().Addr().String(), a.KeycloakEndpoint().Addr().String()
-	for _, address := range append([]string{a.DHCP, a.PXE, a.API, rest, keycloak, a.DNS}, a.NTP...) {
-		if address != "" && !slices.Contains(out, address) {
-			out = append(out, address)
-		}
-	}
-	return out
 }
 
 // applyCarried writes the carried Secrets where the site's NICo reads them.
@@ -635,10 +540,10 @@ func parseSiteState(out, siteID string) (SiteState, error) {
 
 // StartSite starts the moved NICo on the site cluster as cfg describes it
 // with ProfileSite, after PrepareSite, the database restores and
-// RestoreVault: Keycloak, NICo Core, REST and the site agent of siteID, each
-// on its LoadBalancer address. It restarts REST's cloud worker once, which
-// starts REST's crons in the site's Temporal, verifies NICo answers on its
-// addresses, and returns how it is reached.
+// RestoreVault and PublishSite: Keycloak, NICo Core, REST and the site agent
+// of siteID. It restarts REST's cloud worker once, which starts REST's crons
+// in the site's Temporal, verifies NICo answers on its addresses, and returns
+// how it is reached.
 func (e *Engine) StartSite(ctx context.Context, kubeconfig, root string, cfg Config, siteID string) (*Installed, error) {
 	if cfg.Settings == nil || cfg.ImageRegistry == "" || cfg.CoreImageTag == "" || cfg.RestImageTag == "" || len(cfg.CoreValues) == 0 {
 		return nil, errors.New("nicodeploy: Settings, ImageRegistry, CoreImageTag, RestImageTag and CoreValues are required")
@@ -691,7 +596,6 @@ func (e *Engine) StartSite(ctx context.Context, kubeconfig, root string, cfg Con
 // dir, one <release>.yaml each, private to their owner. They hold secrets.
 func (e *Engine) WriteHelmValues(ctx context.Context, kubeconfig, dir string) error {
 	for _, r := range [][2]string{
-		{metallbRelease, metallbNamespace},
 		{"postgres-operator", postgresNamespace},
 		{"vault", vaultNamespace},
 		{"external-secrets", esoNamespace},

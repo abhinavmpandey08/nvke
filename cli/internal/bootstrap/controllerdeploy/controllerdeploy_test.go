@@ -1399,7 +1399,6 @@ func TestDeploy_ChartsMatchTheBootstrapManifest(t *testing.T) {
 	// nicodeploy installs NICo's charts, not Deploy.
 	for _, name := range []string{
 		manifest.ComponentPostgresOperator, manifest.ComponentVault, manifest.ComponentExternalSecrets, manifest.ComponentCertManager,
-		manifest.ComponentMetalLB,
 	} {
 		delete(pinned, name)
 	}

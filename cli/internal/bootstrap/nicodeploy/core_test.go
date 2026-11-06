@@ -60,31 +60,18 @@ func TestCoreOverrides(t *testing.T) {
 				for _, chart := range []string{"nico-api", "nico-dhcp", "nico-pxe", "nico-ssh-console-rs", "nico-ntp", "unbound"} {
 					assert.Equal(t, false, at(v, chart, "externalService", "enabled"), chart)
 				}
+				for _, chart := range []string{"nico-api", "nico-pxe"} {
+					assert.Equal(t, false, at(v, chart, "legacyAlias", "enabled"), chart)
+				}
 			},
 		},
 		{
-			name:    "site pins each service to its address",
+			name:    "site leaves publishing to nvkectl",
 			profile: ProfileSite,
 			check: func(t *testing.T, v map[string]any) {
-				for chart, ip := range map[string]string{
-					"nico-api": "10.0.0.43", "nico-dhcp": "10.0.0.67", "nico-pxe": "10.0.0.80", "unbound": "10.0.0.53",
-				} {
-					assert.Equal(t, true, at(v, chart, "externalService", "enabled"), chart)
-					assert.Equal(t, ip, at(v, chart, "externalService", "annotations", lbIPsAnnotation), chart)
+				for _, chart := range []string{"nico-api", "nico-dhcp", "nico-pxe", "nico-ssh-console-rs", "nico-ntp", "unbound"} {
+					assert.Equal(t, false, at(v, chart, "externalService", "enabled"), chart)
 				}
-				for _, chart := range []string{"nico-api", "nico-pxe", "unbound"} {
-					assert.Equal(t, "Local", at(v, chart, "externalService", "externalTrafficPolicy"), chart)
-				}
-				assert.Nil(t, at(v, "nico-dhcp", "externalService", "externalTrafficPolicy"), "the DHCP chart takes no policy")
-				assert.Equal(t, []map[string]any{{lbIPsAnnotation: "10.0.0.123"}, {lbIPsAnnotation: "10.0.0.124"}},
-					at(v, "nico-ntp", "externalService", "perPodAnnotations"))
-			},
-		},
-		{
-			name:    "site keeps the SSH console inside",
-			profile: ProfileSite,
-			check: func(t *testing.T, v map[string]any) {
-				assert.Equal(t, false, at(v, "nico-ssh-console-rs", "externalService", "enabled"))
 			},
 		},
 		{

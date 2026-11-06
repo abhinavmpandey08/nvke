@@ -21,9 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
-	sigsyaml "sigs.k8s.io/yaml"
-
-	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
 )
 
 // index returns the position of the first call containing want, or -1.
@@ -34,31 +31,6 @@ func (r *recordingRunner) index(want string) int {
 		}
 	}
 	return -1
-}
-
-func TestMetalLBPool(t *testing.T) {
-	a := nicosettings.Addresses{
-		DHCP: "10.0.0.67", PXE: "10.0.0.80", API: "10.0.0.43", REST: "10.0.0.88", Keycloak: "fd00::82",
-		NTP: []string{"10.0.0.123", "10.0.0.124"},
-	}
-	out, err := metalLBPool(a)
-	require.NoError(t, err)
-	docs := strings.Split(string(out), "---\n")
-	require.Len(t, docs, 2)
-
-	var pool, adv map[string]any
-	require.NoError(t, sigsyaml.Unmarshal([]byte(docs[0]), &pool))
-	require.NoError(t, sigsyaml.Unmarshal([]byte(docs[1]), &adv))
-	assert.Equal(t, "IPAddressPool", pool["kind"])
-	assert.Equal(t, map[string]any{"name": metallbPool, "namespace": metallbNamespace}, pool["metadata"])
-	assert.Equal(t, []any{"10.0.0.67/32", "10.0.0.80/32", "10.0.0.43/32", "10.0.0.88/32", "fd00::82/128", "10.0.0.123/32", "10.0.0.124/32"},
-		valueAt(pool, "spec", "addresses"), "every address once")
-	assert.Equal(t, false, valueAt(pool, "spec", "autoAssign"), "only Services that name an address get one")
-	assert.Equal(t, "L2Advertisement", adv["kind"])
-	assert.Equal(t, []any{metallbPool}, valueAt(adv, "spec", "ipAddressPools"))
-
-	_, err = metalLBPool(nicosettings.Addresses{DHCP: "not-an-ip"})
-	assert.Error(t, err)
 }
 
 func TestBusyWorkflows(t *testing.T) {

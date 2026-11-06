@@ -73,6 +73,7 @@ type engine interface {
 	SnapshotVault(ctx context.Context, kubeconfig, path string) error
 	RestoreVault(ctx context.Context, kubeconfig, root string, cfg nicodeploy.Config, snapshot string, keys nicodeploy.VaultKeys) error
 	SiteState(ctx context.Context, kubeconfig, siteID string) (nicodeploy.SiteState, error)
+	PublishSite(ctx context.Context, cfg nicodeploy.Config) error
 	StartSite(ctx context.Context, kubeconfig, root string, cfg nicodeploy.Config, siteID string) (*nicodeploy.Installed, error)
 	WriteHelmValues(ctx context.Context, kubeconfig, dir string) error
 }
@@ -84,9 +85,9 @@ var _ engine = (*nicodeploy.Engine)(nil)
 // (CAPNICo on the site, REST on the bootstrap cluster), waits for the
 // workflows already running to finish, stops the bootstrap cluster's NICo,
 // moves its databases and Vault, withdraws the service addresses from the
-// bootstrap host, starts NICo on the site with the same site ID, restarts
-// CAPNICo, and checks that the site agent reports and the machines kept their
-// status. It then writes the handover bundle to Site.Settings.HandoverDir and
+// bootstrap host, publishes them on the site cluster, starts NICo on the site
+// with the same site ID, restarts CAPNICo, and checks that the site agent
+// reports and the machines kept their status. It then writes the handover bundle to Site.Settings.HandoverDir and
 // the ConfigMap nico-system/nvkectl-handover. The bootstrap cluster's NICo is
 // left stopped, with its state, so a failed move can be recovered from it.
 func Run(ctx context.Context, cfg Config) (*nicodeploy.Installed, error) {
@@ -197,6 +198,9 @@ func (m *mover) run(ctx context.Context) (*nicodeploy.Installed, error) {
 			return nil, fmt.Errorf("withdrawing NICo's service addresses from the bootstrap host: %w", err)
 		}
 	}
+	if err := m.publishSite(ctx); err != nil {
+		return nil, err
+	}
 	m.log.Info("starting NICo on the site cluster")
 	inst, err := m.site.StartSite(ctx, c.SiteKubeconfig, c.Root, c.Site, c.SiteID)
 	if err != nil {
@@ -217,6 +221,14 @@ func (m *mover) run(ctx context.Context) (*nicodeploy.Installed, error) {
 	}
 	m.log.Info("NICo is moved to the site cluster and handed over", "siteID", c.SiteID, "handover", dir)
 	return inst, nil
+}
+
+// publishSite publishes NICo's service addresses on the site cluster. It runs
+// only once the bootstrap host has withdrawn them, so no address is announced
+// from both.
+func (m *mover) publishSite(ctx context.Context) error {
+	m.log.Info("publishing NICo's service addresses on the site cluster")
+	return m.site.PublishSite(ctx, m.cfg.Site)
 }
 
 // drain waits until no workflow but the periodic ones runs in the bootstrap

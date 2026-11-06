@@ -87,7 +87,7 @@ func (m *mover) writeHandover(ctx context.Context, dir string, carried nicodeplo
 func chartVersions(cfg nicodeploy.Config) map[string]any {
 	man := manifest.Load()
 	charts := map[string]any{}
-	for _, c := range []string{manifest.ComponentPostgresOperator, manifest.ComponentVault, manifest.ComponentExternalSecrets, manifest.ComponentMetalLB} {
+	for _, c := range []string{manifest.ComponentPostgresOperator, manifest.ComponentVault, manifest.ComponentExternalSecrets} {
 		if chart := man.Components[c].Chart; chart != nil {
 			charts[c] = chart
 		}

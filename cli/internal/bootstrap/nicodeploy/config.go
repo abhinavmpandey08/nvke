@@ -21,7 +21,8 @@ const (
 	// its address on the bootstrap host.
 	ProfileSeed Profile = iota
 	// ProfileSite runs NICo on the site cluster: the settings' replicas and
-	// StorageClass, and every service on a LoadBalancer address MetalLB holds.
+	// StorageClass, and every service on an address the site's kube-vip
+	// announces.
 	ProfileSite
 )
 
@@ -58,6 +59,10 @@ type Config struct {
 	Profile Profile
 	// Dial connects nvkectl's REST client; a plain dialer when nil. See SeedLoopback.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// ControlPlaneVIP is the site cluster's control-plane VIP. With
+	// ProfileSite, REST or Keycloak on this address is published on a node
+	// port of the VIP.
+	ControlPlaneVIP string
 	// siteRootCarried is set when the site root CA was copied from the
 	// bootstrap cluster, so the prerequisites use it instead of issuing one.
 	siteRootCarried bool

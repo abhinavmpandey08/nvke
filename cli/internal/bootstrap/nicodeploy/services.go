@@ -159,14 +159,8 @@ func (e *Engine) installRESTChart(ctx context.Context, kubeconfig, root, tmp str
 	if err := writeValues(values, restOverrides(cfg, string(creds.Data["username"]), string(creds.Data["password"]), login)); err != nil {
 		return err
 	}
-	if err := e.helm(ctx, kubeconfig, "nico-rest", restNamespace, []string{filepath.Join(root, "helm", "rest", "nico-rest")},
-		[]string{filepath.Join(root, "helm-prereqs", "values", "nico-rest.yaml"), values}, cfg.Timeout); err != nil {
-		return err
-	}
-	if cfg.Profile == ProfileSite {
-		return e.applyLoadBalancer(ctx, restNamespace, "nico-rest-api", cfg.Settings.Addresses.RESTEndpoint().Addr().String(), 8388)
-	}
-	return nil
+	return e.helm(ctx, kubeconfig, "nico-rest", restNamespace, []string{filepath.Join(root, "helm", "rest", "nico-rest")},
+		[]string{filepath.Join(root, "helm-prereqs", "values", "nico-rest.yaml"), values}, cfg.Timeout)
 }
 
 // restOverrides is what NICo REST takes beyond NICo's values: the images and
@@ -223,51 +217,6 @@ func clientCredentials(cfg Config, login *keycloakLogin) nicorest.ClientCredenti
 		ClientID:     serviceClientID,
 		ClientSecret: login.ServiceSecret,
 	}
-}
-
-// applyLoadBalancer publishes port of the chart Service name on ip: a
-// LoadBalancer Service <name>-external with the same selector, which MetalLB
-// gives that address.
-func (e *Engine) applyLoadBalancer(ctx context.Context, namespace, name, ip string, port int32) error {
-	services := e.kube.CoreV1().Services(namespace)
-	src, err := services.Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("reading Service %s/%s: %w", namespace, name, err)
-	}
-	var ports []corev1.ServicePort
-	for _, p := range src.Spec.Ports {
-		if p.Port == port {
-			p.NodePort = 0
-			ports = append(ports, p)
-		}
-	}
-	if len(ports) == 0 {
-		return fmt.Errorf("the Service %s/%s has no port %d", namespace, name, port)
-	}
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace, Name: name + "-external",
-			Annotations: map[string]string{lbIPsAnnotation: ip},
-		},
-		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer, Selector: src.Spec.Selector, Ports: ports},
-	}
-	_, err = services.Create(ctx, svc, metav1.CreateOptions{})
-	if !apierrors.IsAlreadyExists(err) {
-		if err != nil {
-			return fmt.Errorf("creating Service %s/%s: %w", namespace, svc.Name, err)
-		}
-		return nil
-	}
-	existing, err := services.Get(ctx, svc.Name, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("reading Service %s/%s: %w", namespace, svc.Name, err)
-	}
-	existing.Annotations = merge(existing.Annotations, svc.Annotations)
-	existing.Spec.Type, existing.Spec.Selector, existing.Spec.Ports = svc.Spec.Type, svc.Spec.Selector, svc.Spec.Ports
-	if _, err := services.Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("updating Service %s/%s: %w", namespace, svc.Name, err)
-	}
-	return nil
 }
 
 // ensureRESTCA creates the CA NICo REST's ClusterIssuer signs with, once, and
@@ -385,11 +334,6 @@ func (e *Engine) installKeycloak(ctx context.Context, kubeconfig, root, tmp stri
 	if _, err := e.kubectl(ctx, kubeconfig, "-n", restNamespace, "rollout", "status", "deployment/keycloak",
 		"--timeout="+cfg.Timeout.String()); err != nil {
 		return nil, err
-	}
-	if cfg.Profile == ProfileSite {
-		if err := e.applyLoadBalancer(ctx, restNamespace, "keycloak", cfg.Settings.Addresses.KeycloakEndpoint().Addr().String(), 8082); err != nil {
-			return nil, err
-		}
 	}
 	return login, nil
 }

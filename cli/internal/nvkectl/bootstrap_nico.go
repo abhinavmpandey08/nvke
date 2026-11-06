@@ -452,12 +452,16 @@ func (n *managedNico) move(
 		return err
 	}
 	logger.Info("moving NICo onto the site cluster", "site", n.inst.SiteID)
+	site := nicodeploy.NewConfig(n.settings, n.secrets, nicodeploy.ProfileSite, bootstrapStorageClass)
+	if n.vip.IsValid() {
+		site.ControlPlaneVIP = n.vip.String()
+	}
 	_, err = nicomove.Run(ctx, nicomove.Config{
 		SeedKubeconfig: seedKubeconfig,
 		SiteKubeconfig: siteKubeconfig,
 		Root:           n.root,
 		Seed:           n.seed,
-		Site:           nicodeploy.NewConfig(n.settings, n.secrets, nicodeploy.ProfileSite, bootstrapStorageClass),
+		Site:           site,
 		SiteID:         n.inst.SiteID,
 		Runner:         runner,
 		SeedKube:       seedKube,

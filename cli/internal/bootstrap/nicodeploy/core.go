@@ -14,9 +14,6 @@ import (
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
 )
 
-// lbIPsAnnotation pins a LoadBalancer Service to an address MetalLB holds.
-const lbIPsAnnotation = "metallb.universe.tf/loadBalancerIPs"
-
 // bootArtifactsDir is where the Core charts mount the boot-artifact volume in
 // the init containers that fill it.
 const bootArtifactsDir = "/forge-boot-artifacts/blobs/internal"
@@ -46,14 +43,16 @@ func (e *Engine) installCore(ctx context.Context, kubeconfig, root, tmp string, 
 
 // coreOverrides is what NICo Core takes beyond NICo's values and the
 // operator's site configuration: the images, the API's host name and the
-// service addresses from the settings, the reduced set of services nvkectl
-// runs, and how each service is published for cfg's profile.
+// service addresses from the settings, and the reduced set of services
+// nvkectl runs. No chart publishes its own service: publishSeed and
+// PublishSite do.
 func coreOverrides(cfg Config) map[string]any {
 	s := cfg.Settings
 	a := s.Addresses
-	site := cfg.Profile == ProfileSite
 	ntp := ntpAddresses(s)
 	boot := bootArtifactContainers(s.Images)
+	// The charts' external Services take no load-balancer class.
+	off := map[string]any{"enabled": false}
 
 	hook := map[string]any{"provisioningServer": a.PXE}
 	if a.DNS != "" {
@@ -82,7 +81,9 @@ func coreOverrides(cfg Config) map[string]any {
 			"componentManager": map[string]any{"enabled": false},
 			"rms":              map[string]any{"enabled": false},
 			"dpf":              map[string]any{"rbacCreate": false},
-			"externalService":  externalService(site, a.API, true),
+			"externalService":  off,
+			// The legacy carbide-* aliases go in forge-system, which only NICo's own prerequisites create.
+			"legacyAlias": off,
 		},
 		"nico-dhcp": map[string]any{
 			"config": map[string]any{"kea": map[string]any{
@@ -90,13 +91,14 @@ func coreOverrides(cfg Config) map[string]any {
 				"serverIdentifier": a.DHCP,
 				"hookParameters":   hook,
 			}},
-			"externalService": externalService(site, a.DHCP, false),
+			"externalService": off,
 		},
 		"nico-pxe": map[string]any{
 			"bootArtifactContainers": boot,
-			"externalService":        externalService(site, a.PXE, true),
+			"externalService":        off,
+			"legacyAlias":            off,
 		},
-		"nico-ssh-console-rs":        map[string]any{"externalService": map[string]any{"enabled": false}},
+		"nico-ssh-console-rs":        map[string]any{"externalService": off},
 		"nico-dns":                   map[string]any{"enabled": false},
 		"nico-flow":                  map[string]any{"enabled": false},
 		"nico-dsx-exchange-consumer": map[string]any{"enabled": false},
@@ -106,18 +108,9 @@ func coreOverrides(cfg Config) map[string]any {
 	}
 
 	if len(a.NTP) > 0 {
-		ntpValues := map[string]any{"enabled": true, "replicas": len(a.NTP)}
+		ntpValues := map[string]any{"enabled": true, "replicas": len(a.NTP), "externalService": off}
 		if len(s.UpstreamNTP) > 0 {
 			ntpValues["ntp"] = map[string]any{"upstreamServers": s.UpstreamNTP}
-		}
-		if site {
-			perPod := make([]map[string]any, len(a.NTP))
-			for i, ip := range a.NTP {
-				perPod[i] = map[string]any{lbIPsAnnotation: ip}
-			}
-			ntpValues["externalService"] = map[string]any{"enabled": true, "perPodAnnotations": perPod}
-		} else {
-			ntpValues["externalService"] = map[string]any{"enabled": false}
 		}
 		overrides["nico-ntp"] = ntpValues
 	}
@@ -129,7 +122,7 @@ func coreOverrides(cfg Config) map[string]any {
 			"image":           map[string]any{"repository": repo, "tag": tag},
 			"localConfig":     map[string]any{"forwarders.conf": forwarders(s.UpstreamDNS)},
 			"localData":       forgeRecords(a, ntp),
-			"externalService": externalService(site, a.DNS, true),
+			"externalService": off,
 		}
 		if s.Images.UnboundExporter != "" {
 			repo, tag := splitImage(s.Images.UnboundExporter)
@@ -140,20 +133,6 @@ func coreOverrides(cfg Config) map[string]any {
 		overrides["unbound"] = unbound
 	}
 	return overrides
-}
-
-// externalService is a Core chart's externalService values: on the site, a
-// LoadBalancer pinned to address, with externalTrafficPolicy Local where the
-// chart takes it; on the seed, or without an address, none.
-func externalService(site bool, address string, localPolicy bool) map[string]any {
-	if !site || address == "" {
-		return map[string]any{"enabled": false}
-	}
-	values := map[string]any{"enabled": true, "annotations": map[string]any{lbIPsAnnotation: address}}
-	if localPolicy {
-		values["externalTrafficPolicy"] = "Local"
-	}
-	return values
 }
 
 // bootArtifactContainers are the init containers that copy the boot artifacts

@@ -174,12 +174,3 @@ components:
       name: cert-manager
       version: "v1.21.1"
       sha256: c27101f3f3e2349fb4a9e704316105bf7b52ad73b8c8257d3498ef7f2f6a4adc
-  # Installed only on the site cluster of infra.nico.managed, where it gives
-  # NICo's services their fixed addresses. The site's kube-vip announces only
-  # the control-plane address.
-  metallb:
-    chart:
-      repo: https://metallb.github.io/metallb
-      name: metallb
-      version: "0.14.5"
-      sha256: 12e8d6a6ef2bf0d6450c10fba55c94282ef2d3559f78d2fbf626000d13baa9ef

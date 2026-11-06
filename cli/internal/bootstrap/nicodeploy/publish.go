@@ -133,6 +133,13 @@ func SeedLoopback(a nicosettings.Addresses, vip netip.Addr) ([]engine.PortMappin
 	}
 }
 
+// The class of the LoadBalancer Services the site's kube-vip handles, and the
+// annotation naming the address it announces for one.
+const (
+	kubeVIPClass         = "kube-vip.io/kube-vip-class"
+	kubeVIPIPsAnnotation = "kube-vip.io/loadbalancerIPs"
+)
+
 // publishSeed creates the NodePort Services the seed's port mappings reach,
 // and their namespaces when they do not exist yet, so it can run before the
 // services it publishes are installed.
@@ -140,9 +147,39 @@ func (e *Engine) publishSeed(ctx context.Context, cfg Config) error {
 	if cfg.Settings == nil {
 		return errors.New("nicodeploy: Settings is required to publish NICo")
 	}
+	services := seedServices(cfg.Settings.Addresses)
+	if err := e.applyServices(ctx, services); err != nil {
+		return err
+	}
+	e.log.Info("NICo's services are published on the bootstrap host", "services", len(services))
+	return nil
+}
+
+// PublishSite publishes NICo's services on their addresses on the site
+// cluster, as cfg describes it with ProfileSite: each is a LoadBalancer
+// Service of kube-vip's class, pinned to its address, with
+// externalTrafficPolicy Local. REST or Keycloak on cfg.ControlPlaneVIP is
+// instead a NodePort Service on its own port, reached on the VIP kube-vip
+// already announces. It creates the namespaces that do not exist yet and can
+// be run again. The bootstrap host must have withdrawn the addresses first.
+func (e *Engine) PublishSite(ctx context.Context, cfg Config) error {
+	if cfg.Settings == nil {
+		return errors.New("nicodeploy: Settings is required to publish NICo")
+	}
+	services := siteServices(cfg.Settings.Addresses, cfg.ControlPlaneVIP)
+	if err := e.applyServices(ctx, services); err != nil {
+		return err
+	}
+	e.log.Info("NICo's services are published on the site cluster", "services", len(services))
+	return nil
+}
+
+// seedServices are the NodePort Services that publish seedPorts on the
+// bootstrap host.
+func seedServices(a nicosettings.Addresses) []*corev1.Service {
 	var services []*corev1.Service
 	byName := map[string]*corev1.Service{}
-	for _, p := range seedPorts(cfg.Settings.Addresses) {
+	for _, p := range seedPorts(a) {
 		s := byName[p.namespace+"/"+p.service]
 		if s == nil {
 			s = &corev1.Service{
@@ -165,6 +202,43 @@ func (e *Engine) publishSeed(ctx context.Context, cfg Config) error {
 			NodePort:   p.nodePort,
 		})
 	}
+	return services
+}
+
+// siteServices are the Services that publish the same ports on the site
+// cluster: LoadBalancer Services of kube-vip's class pinned to their
+// addresses, except a NodePort Service on its own ports for an address that is
+// controlPlaneVIP.
+func siteServices(a nicosettings.Addresses, controlPlaneVIP string) []*corev1.Service {
+	vip, _ := netip.ParseAddr(controlPlaneVIP)
+	address := map[string]string{}
+	for _, p := range seedPorts(a) {
+		address[p.namespace+"/"+p.service] = p.address
+	}
+	services := seedServices(a)
+	for _, s := range services {
+		ip := address[s.Namespace+"/"+s.Name]
+		if addr, err := netip.ParseAddr(ip); err == nil && addr == vip {
+			// Every control-plane node announces the VIP over BGP, and need not run the service's pods.
+			s.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyCluster
+			for i := range s.Spec.Ports {
+				s.Spec.Ports[i].NodePort = s.Spec.Ports[i].Port
+			}
+			continue
+		}
+		class := kubeVIPClass
+		s.Annotations = map[string]string{kubeVIPIPsAnnotation: ip}
+		s.Spec.Type = corev1.ServiceTypeLoadBalancer
+		s.Spec.LoadBalancerClass = &class
+		for i := range s.Spec.Ports {
+			s.Spec.Ports[i].NodePort = 0
+		}
+	}
+	return services
+}
+
+// applyServices applies each of services, creating its namespace when it does not exist yet.
+func (e *Engine) applyServices(ctx context.Context, services []*corev1.Service) error {
 	for _, s := range services {
 		if err := e.ensureNamespace(ctx, s.Namespace, nil, nil); err != nil {
 			return err
@@ -173,12 +247,11 @@ func (e *Engine) publishSeed(ctx context.Context, cfg Config) error {
 			return err
 		}
 	}
-	e.log.Info("NICo's services are published on the bootstrap host", "services", len(services))
 	return nil
 }
 
 // applyService creates s, or replaces the spec of the Service of its name
-// while keeping its cluster IP.
+// while keeping its cluster IP, and adds s's annotations to it.
 func (e *Engine) applyService(ctx context.Context, s *corev1.Service) error {
 	services := e.kube.CoreV1().Services(s.Namespace)
 	_, err := services.Create(ctx, s, metav1.CreateOptions{})
@@ -191,6 +264,8 @@ func (e *Engine) applyService(ctx context.Context, s *corev1.Service) error {
 		existing.Spec.Selector = s.Spec.Selector
 		existing.Spec.Ports = s.Spec.Ports
 		existing.Spec.ExternalTrafficPolicy = s.Spec.ExternalTrafficPolicy
+		existing.Spec.LoadBalancerClass = s.Spec.LoadBalancerClass
+		existing.Annotations = merge(existing.Annotations, s.Annotations)
 		_, err = services.Update(ctx, existing, metav1.UpdateOptions{})
 	}
 	if err != nil {

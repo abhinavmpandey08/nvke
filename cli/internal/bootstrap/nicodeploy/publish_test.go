@@ -152,3 +152,125 @@ func TestPublishSeed(t *testing.T) {
 		})
 	}
 }
+
+func TestPublishSite(t *testing.T) {
+	kubeVIP := kubeVIPClass
+	dhcp := map[string]string{"app.kubernetes.io/name": "nico-dhcp", "app.kubernetes.io/component": "dhcp"}
+	rest := map[string]string{"app": "nico-rest-api", "app.kubernetes.io/name": "nico-rest-api", "app.kubernetes.io/component": "api"}
+	keycloak := map[string]string{"app": "keycloak"}
+	type want struct {
+		namespace, name string
+		typ             corev1.ServiceType
+		class           *string
+		address         string
+		policy          corev1.ServiceExternalTrafficPolicy
+		selector        map[string]string
+		ports           []corev1.ServicePort
+	}
+	tests := []struct {
+		name string
+		edit func(*nicosettings.Addresses)
+		vip  string
+		want []want
+	}{
+		{
+			name: "every address on a kube-vip LoadBalancer",
+			vip:  "10.0.0.250",
+			want: []want{
+				{
+					namespace: nicoNamespace, name: "nvkectl-nico-dhcp", typ: corev1.ServiceTypeLoadBalancer, class: &kubeVIP,
+					address: "10.0.0.67", policy: corev1.ServiceExternalTrafficPolicyLocal, selector: dhcp,
+					ports: []corev1.ServicePort{{Name: "udp-67", Protocol: corev1.ProtocolUDP, Port: 67, TargetPort: intstr.FromInt32(67)}},
+				},
+				{
+					namespace: nicoNamespace, name: "nvkectl-unbound", typ: corev1.ServiceTypeLoadBalancer, class: &kubeVIP,
+					address: "10.0.0.53", policy: corev1.ServiceExternalTrafficPolicyLocal,
+					selector: map[string]string{
+						"app.kubernetes.io/component": "recursive-dns", "app.kubernetes.io/instance": "nico-unbound",
+						"app.kubernetes.io/managed-by": "Helm", "app.kubernetes.io/name": "unbound",
+					},
+					ports: []corev1.ServicePort{
+						{Name: "udp-53", Protocol: corev1.ProtocolUDP, Port: 53, TargetPort: intstr.FromString("dns-udp")},
+						{Name: "tcp-53", Protocol: corev1.ProtocolTCP, Port: 53, TargetPort: intstr.FromString("dns-tcp")},
+					},
+				},
+				{
+					namespace: nicoNamespace, name: "nvkectl-nico-ntp-1", typ: corev1.ServiceTypeLoadBalancer, class: &kubeVIP,
+					address: "10.0.0.124", policy: corev1.ServiceExternalTrafficPolicyLocal,
+					selector: map[string]string{"app.kubernetes.io/name": "nico-ntp", "statefulset.kubernetes.io/pod-name": "nico-ntp-1"},
+					ports:    []corev1.ServicePort{{Name: "udp-123", Protocol: corev1.ProtocolUDP, Port: 123, TargetPort: intstr.FromInt32(123)}},
+				},
+				{
+					namespace: restNamespace, name: "nvkectl-nico-rest-api", typ: corev1.ServiceTypeLoadBalancer, class: &kubeVIP,
+					address: "10.0.0.88", policy: corev1.ServiceExternalTrafficPolicyLocal, selector: rest,
+					ports: []corev1.ServicePort{{Name: "tcp-8388", Protocol: corev1.ProtocolTCP, Port: 8388, TargetPort: intstr.FromInt32(8388)}},
+				},
+			},
+		},
+		{
+			name: "REST and Keycloak on node ports of the control-plane VIP",
+			edit: func(a *nicosettings.Addresses) { a.REST, a.Keycloak = "10.0.0.250:30388", "10.0.0.250:30082" },
+			vip:  "10.0.0.250",
+			want: []want{
+				{
+					namespace: restNamespace, name: "nvkectl-nico-rest-api", typ: corev1.ServiceTypeNodePort,
+					policy: corev1.ServiceExternalTrafficPolicyCluster, selector: rest,
+					ports: []corev1.ServicePort{{Name: "tcp-30388", Protocol: corev1.ProtocolTCP, Port: 30388, TargetPort: intstr.FromInt32(8388), NodePort: 30388}},
+				},
+				{
+					namespace: restNamespace, name: "nvkectl-keycloak", typ: corev1.ServiceTypeNodePort,
+					policy: corev1.ServiceExternalTrafficPolicyCluster, selector: keycloak,
+					ports: []corev1.ServicePort{{Name: "tcp-30082", Protocol: corev1.ProtocolTCP, Port: 30082, TargetPort: intstr.FromInt32(8080), NodePort: 30082}},
+				},
+				{
+					namespace: nicoNamespace, name: "nvkectl-nico-dhcp", typ: corev1.ServiceTypeLoadBalancer, class: &kubeVIP,
+					address: "10.0.0.67", policy: corev1.ServiceExternalTrafficPolicyLocal, selector: dhcp,
+					ports: []corev1.ServicePort{{Name: "udp-67", Protocol: corev1.ProtocolUDP, Port: 67, TargetPort: intstr.FromInt32(67)}},
+				},
+			},
+		},
+		{
+			name: "REST and Keycloak share an address off the VIP",
+			edit: func(a *nicosettings.Addresses) { a.REST, a.Keycloak = "10.0.0.88:8388", "10.0.0.88:8082" },
+			want: []want{
+				{
+					namespace: restNamespace, name: "nvkectl-nico-rest-api", typ: corev1.ServiceTypeLoadBalancer, class: &kubeVIP,
+					address: "10.0.0.88", policy: corev1.ServiceExternalTrafficPolicyLocal, selector: rest,
+					ports: []corev1.ServicePort{{Name: "tcp-8388", Protocol: corev1.ProtocolTCP, Port: 8388, TargetPort: intstr.FromInt32(8388)}},
+				},
+				{
+					namespace: restNamespace, name: "nvkectl-keycloak", typ: corev1.ServiceTypeLoadBalancer, class: &kubeVIP,
+					address: "10.0.0.88", policy: corev1.ServiceExternalTrafficPolicyLocal, selector: keycloak,
+					ports: []corev1.ServicePort{{Name: "tcp-8082", Protocol: corev1.ProtocolTCP, Port: 8082, TargetPort: intstr.FromInt32(8080)}},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			kube := fake.NewClientset()
+			e := New(nil, kube, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			settings := testSettings()
+			if tt.edit != nil {
+				tt.edit(&settings.Addresses)
+			}
+			cfg := NewConfig(settings, nicosettings.Secrets{}, ProfileSite, "standard")
+			cfg.ControlPlaneVIP = tt.vip
+
+			require.NoError(t, e.PublishSite(ctx, cfg))
+			require.NoError(t, e.PublishSite(ctx, cfg), "a rerun updates the Services")
+
+			for _, w := range tt.want {
+				s, err := kube.CoreV1().Services(w.namespace).Get(ctx, w.name, metav1.GetOptions{})
+				require.NoError(t, err, w.name)
+				assert.Equal(t, w.typ, s.Spec.Type, w.name)
+				assert.Equal(t, w.class, s.Spec.LoadBalancerClass, w.name)
+				assert.Equal(t, w.address, s.Annotations[kubeVIPIPsAnnotation], w.name)
+				assert.Equal(t, w.policy, s.Spec.ExternalTrafficPolicy, w.name)
+				assert.Equal(t, w.selector, s.Spec.Selector, w.name)
+				assert.Equal(t, w.ports, s.Spec.Ports, w.name)
+			}
+		})
+	}
+}

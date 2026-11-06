@@ -110,6 +110,10 @@ func (f *fakeEngine) SiteState(context.Context, string, string) (nicodeploy.Site
 	return s, nil
 }
 
+func (f *fakeEngine) PublishSite(context.Context, nicodeploy.Config) error {
+	return f.record("PublishSite")
+}
+
 func (f *fakeEngine) StartSite(context.Context, string, string, nicodeploy.Config, string) (*nicodeploy.Installed, error) {
 	return &nicodeploy.Installed{SiteID: siteID, RESTEndpoint: "http://10.0.0.88:8388"}, f.record("StartSite")
 }
@@ -178,6 +182,7 @@ func TestRunOrder(t *testing.T) {
 		"seed SnapshotVault",
 		"site RestoreVault",
 		"host RemoveHostAddresses",
+		"site PublishSite",
 		"site StartSite",
 	}, *log)
 
@@ -205,7 +210,7 @@ func TestRunOrder(t *testing.T) {
 	versions, err := os.ReadFile(filepath.Join(dir, "versions.yaml"))
 	require.NoError(t, err)
 	assert.Contains(t, string(versions), "version: v2.2.2")
-	assert.Contains(t, string(versions), "metallb")
+	assert.Contains(t, string(versions), "postgres-operator")
 
 	cm, err := m.cfg.SiteKube.CoreV1().ConfigMaps(handoverNamespace).Get(ctx, handoverConfigMap, metav1.GetOptions{})
 	require.NoError(t, err)
