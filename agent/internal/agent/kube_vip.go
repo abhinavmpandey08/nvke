@@ -48,6 +48,8 @@ const (
 	ipDeviceFlag               = "dev"
 	kubeVipFalse               = "false"
 	kubeVipTrue                = "true"
+	// kubeVipLoadBalancerClass is the only Service class kube-vip serves.
+	kubeVipLoadBalancerClass = "kube-vip.io/kube-vip-class"
 )
 
 type kubeVipAddress struct {
@@ -62,11 +64,12 @@ type kubeVipRoute struct {
 	Gateway     string `json:"gateway"`
 }
 
-// ReconcileKubeVip converges NVKE's credential-less, active/active BGP
-// kube-vip static pod. The fixed manifest deliberately excludes every
-// Kubernetes API-backed kube-vip feature and models the single-peer settings
-// the controller historically supplied to the runbook rather than its operator-only
-// environment overrides.
+// ReconcileKubeVip converges NVKE's active/active BGP kube-vip static pod. The
+// fixed manifest models the single-peer settings the controller historically
+// supplied to the runbook rather than its operator-only environment overrides.
+// Without a service-account token the kubeconfig is credential-less and every
+// Kubernetes API-backed kube-vip feature stays off; with one, kube-vip also
+// serves LoadBalancer Services of kubeVipLoadBalancerClass.
 func (s *NodeAgentServer) ReconcileKubeVip(
 	ctx context.Context,
 	req *pb.ReconcileKubeVipRequest,
@@ -104,9 +107,14 @@ func (s *NodeAgentServer) ReconcileKubeVip(
 		return nil, status.Errorf(codes.Unavailable, "resolve BGP peer ASN: %v", err)
 	}
 
-	kubeconfig, err := credentiallessKubeVipConfig()
+	token := req.GetServiceAccountToken()
+	kubeconfig, err := kubeVipConfig(token)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "render credential-less kubeconfig: %v", err)
+		return nil, status.Errorf(codes.Internal, "render kube-vip kubeconfig: %v", err)
+	}
+	kubeconfigMode := os.FileMode(0o644)
+	if token != "" {
+		kubeconfigMode = 0o600
 	}
 	manifest, err := renderKubeVipManifest(req, bgpInterface, peerAddress, peerASN)
 	if err != nil {
@@ -116,9 +124,9 @@ func (s *NodeAgentServer) ReconcileKubeVip(
 	// The static-pod manifest is the activation boundary: kubelet may start it as
 	// soon as the rename completes. Converge its kubeconfig and remove stale VIP
 	// assignments first so the pod never starts with missing or duplicate state.
-	kubeconfigChanged, err := s.writeKubeVipFile(kubeVipKubeconfigPath, kubeconfig)
+	kubeconfigChanged, err := s.writeKubeVipFile(kubeVipKubeconfigPath, kubeconfig, kubeconfigMode)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "reconcile credential-less kubeconfig: %v", err)
+		return nil, status.Errorf(codes.Internal, "reconcile kube-vip kubeconfig: %v", err)
 	}
 	// Preserve runbook convergence after an interface change: remove stale
 	// copies without flapping the desired loopback address on a no-op rerun.
@@ -134,7 +142,8 @@ func (s *NodeAgentServer) ReconcileKubeVip(
 		"bgpInterface", bgpInterface,
 		"bgpPeerAddress", peerAddress,
 		"bgpPeerASN", peerASN,
-		"credentiallessKubeconfigChanged", kubeconfigChanged,
+		"kubeconfigChanged", kubeconfigChanged,
+		"serviceMode", token != "",
 	)
 	return &pb.ReconcileKubeVipResponse{
 		Outcome:           outcome,
@@ -324,15 +333,18 @@ func (s *NodeAgentServer) cleanupKubeVipInterfaces(addresses []kubeVipAddress, v
 	return cleaned
 }
 
-func credentiallessKubeVipConfig() ([]byte, error) {
-	return clientcmd.Write(credentiallessKubeVipAPIConfig())
+// kubeVipConfig renders kube-vip's kubeconfig, carrying token when it is set.
+func kubeVipConfig(token string) ([]byte, error) {
+	config := credentiallessKubeVipAPIConfig()
+	config.AuthInfos["kube-vip"].Token = token
+	return clientcmd.Write(config)
 }
 
 func credentiallessKubeVipAPIConfig() clientcmdapi.Config {
 	const name = "kube-vip"
-	// The empty AuthInfo is intentional: current fixed-mode kube-vip only needs
-	// client-go to construct successfully. If an API-backed feature is enabled
-	// later, its requests fail closed as unauthenticated instead of inheriting a
+	// The empty AuthInfo is intentional: without a service-account token,
+	// kube-vip only needs client-go to construct successfully, and any API
+	// request fails closed as unauthenticated instead of inheriting a
 	// control-plane private key.
 	return clientcmdapi.Config{
 		Clusters: map[string]*clientcmdapi.Cluster{
@@ -356,7 +368,7 @@ func (s *NodeAgentServer) writeKubeVipManifest(manifest []byte) (pb.ReconcileKub
 	if statErr != nil && !os.IsNotExist(statErr) {
 		return pb.ReconcileKubeVipResponse_OUTCOME_UNSPECIFIED, fmt.Errorf("stat %s: %w", kubeVipManifestPath, statErr)
 	}
-	changed, err := s.writeKubeVipFile(kubeVipManifestPath, manifest)
+	changed, err := s.writeKubeVipFile(kubeVipManifestPath, manifest, 0o644)
 	if err != nil {
 		return pb.ReconcileKubeVipResponse_OUTCOME_UNSPECIFIED, err
 	}
@@ -374,7 +386,7 @@ func (s *NodeAgentServer) writeKubeVipManifest(manifest []byte) (pb.ReconcileKub
 // restart when the content is already current. atomicWriteFile renders through
 // a hidden file in the destination directory, which kubelet ignores until the
 // same-filesystem rename makes the complete manifest visible.
-func (s *NodeAgentServer) writeKubeVipFile(path string, desired []byte) (bool, error) {
+func (s *NodeAgentServer) writeKubeVipFile(path string, desired []byte, mode os.FileMode) (bool, error) {
 	resolved := s.rootedPath(path)
 	if err := validateKubeVipFileDestination(resolved); err != nil {
 		return false, fmt.Errorf("invalid destination %s: %w", path, err)
@@ -392,7 +404,7 @@ func (s *NodeAgentServer) writeKubeVipFile(path string, desired []byte) (bool, e
 	if err := validateKubeVipFileDestination(resolved); err != nil {
 		return false, fmt.Errorf("invalid destination %s: %w", path, err)
 	}
-	if err := atomicWriteFile(resolved, desired, 0o644); err != nil {
+	if err := atomicWriteFile(resolved, desired, mode); err != nil {
 		return false, fmt.Errorf("write %s atomically: %w", path, err)
 	}
 	written, err := os.ReadFile(resolved)
@@ -532,7 +544,11 @@ func kubeVipEnvironment(
 	// threshold damp transient route churn. The 10s timeout accommodates its
 	// etcd linearizable-read path under load, and the mounted kubeadm CA verifies
 	// the private HTTPS serving certificate.
-	return []corev1.EnvVar{
+	//
+	// Service mode needs API credentials, so it starts only once the controller
+	// hands over the service-account token, and serves only its own class.
+	serviceMode := req.GetServiceAccountToken() != ""
+	environment := []corev1.EnvVar{
 		{Name: "vip_arp", Value: kubeVipFalse},
 		{Name: "port", Value: "6443"},
 		{Name: "vip_nodename", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
@@ -541,7 +557,7 @@ func kubeVipEnvironment(
 		{Name: "dns_mode", Value: "first"},
 		{Name: "cp_enable", Value: kubeVipTrue},
 		{Name: "cp_namespace", Value: kubeSystemNamespace},
-		{Name: "svc_enable", Value: kubeVipFalse},
+		{Name: "svc_enable", Value: strconv.FormatBool(serviceMode)},
 		{Name: "svc_leasename", Value: "plndr-svcs-lock"},
 		{Name: "bgp_enable", Value: kubeVipTrue},
 		{Name: "address", Value: req.GetVipAddress()},
@@ -557,4 +573,11 @@ func kubeVipEnvironment(
 		{Name: "control_plane_health_check_failure_threshold", Value: "3"},
 		{Name: "control_plane_health_check_ca_path", Value: kubeVipCACertPath},
 	}
+	if !serviceMode {
+		return environment
+	}
+	return append(environment,
+		corev1.EnvVar{Name: "lb_class_only", Value: kubeVipTrue},
+		corev1.EnvVar{Name: "lb_class_name", Value: kubeVipLoadBalancerClass},
+	)
 }

@@ -125,10 +125,12 @@ type NodeAgentClient interface {
 	// idempotent and is run again to finish any incomplete add-on convergence.
 	KubeadmUpgradeApply(ctx context.Context, in *KubeadmUpgradeApplyRequest, opts ...grpc.CallOption) (*KubeadmUpgradeApplyResponse, error)
 	// ReconcileKubeVip atomically converges the kube-vip static-pod manifest for
-	// NVKE's active/active BGP control-plane mode. The fixed mode disables every
-	// Kubernetes API-backed kube-vip feature. For kube-vip v1.2.0 compatibility,
-	// the pod receives a kubeconfig with no client credential; this RPC never
-	// reads, creates, or mounts the host's admin.conf or super-admin.conf.
+	// NVKE's active/active BGP control-plane mode. Without a service-account
+	// token the pod receives a kubeconfig with no client credential and every
+	// Kubernetes API-backed kube-vip feature stays off. With one, kube-vip also
+	// runs in service mode, limited to Services of load balancer class
+	// kube-vip.io/kube-vip-class. This RPC never reads, creates, or mounts the
+	// host's admin.conf or super-admin.conf.
 	ReconcileKubeVip(ctx context.Context, in *ReconcileKubeVipRequest, opts ...grpc.CallOption) (*ReconcileKubeVipResponse, error)
 	// StartKubernetesCertificateRenewal starts a V1 asynchronous control-plane
 	// certificate renewal operation. The operation_id is an idempotency key.
@@ -1018,10 +1020,12 @@ type NodeAgentServer interface {
 	// idempotent and is run again to finish any incomplete add-on convergence.
 	KubeadmUpgradeApply(context.Context, *KubeadmUpgradeApplyRequest) (*KubeadmUpgradeApplyResponse, error)
 	// ReconcileKubeVip atomically converges the kube-vip static-pod manifest for
-	// NVKE's active/active BGP control-plane mode. The fixed mode disables every
-	// Kubernetes API-backed kube-vip feature. For kube-vip v1.2.0 compatibility,
-	// the pod receives a kubeconfig with no client credential; this RPC never
-	// reads, creates, or mounts the host's admin.conf or super-admin.conf.
+	// NVKE's active/active BGP control-plane mode. Without a service-account
+	// token the pod receives a kubeconfig with no client credential and every
+	// Kubernetes API-backed kube-vip feature stays off. With one, kube-vip also
+	// runs in service mode, limited to Services of load balancer class
+	// kube-vip.io/kube-vip-class. This RPC never reads, creates, or mounts the
+	// host's admin.conf or super-admin.conf.
 	ReconcileKubeVip(context.Context, *ReconcileKubeVipRequest) (*ReconcileKubeVipResponse, error)
 	// StartKubernetesCertificateRenewal starts a V1 asynchronous control-plane
 	// certificate renewal operation. The operation_id is an idempotency key.

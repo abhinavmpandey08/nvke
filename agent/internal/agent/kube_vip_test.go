@@ -118,6 +118,7 @@ func TestReconcileKubeVipConvergesManifest(t *testing.T) {
 		wantPeerASN     uint32
 		wantConfigFetch bool
 		preexisting     bool
+		token           string
 		wantOutcome     pb.ReconcileKubeVipResponse_Outcome
 	}{
 		{
@@ -150,6 +151,16 @@ func TestReconcileKubeVipConvergesManifest(t *testing.T) {
 			wantConfigFetch: true,
 			wantOutcome:     pb.ReconcileKubeVipResponse_OUTCOME_CREATED,
 		},
+		{
+			name:        "service-account token enables class-gated service mode",
+			role:        ControlPlaneRole,
+			source:      pb.ReconcileKubeVipRequest_BGP_PEER_ASN_SOURCE_STATIC,
+			staticASN:   4294967000,
+			wantPeerASN: 4294967000,
+			preexisting: true,
+			token:       "example-token",
+			wantOutcome: pb.ReconcileKubeVipResponse_OUTCOME_UPDATED,
+		},
 	}
 
 	for _, test := range tests {
@@ -177,12 +188,13 @@ func TestReconcileKubeVipConvergesManifest(t *testing.T) {
 				},
 			}
 			request := &pb.ReconcileKubeVipRequest{
-				VipAddress:       vip,
-				BgpAsn:           65100,
-				NodeIp:           nodeIP,
-				BgpPeerAsnSource: test.source,
-				BgpPeerAsn:       test.staticASN,
-				FmdsEndpoint:     test.fmdsEndpoint,
+				VipAddress:          vip,
+				BgpAsn:              65100,
+				NodeIp:              nodeIP,
+				BgpPeerAsnSource:    test.source,
+				BgpPeerAsn:          test.staticASN,
+				FmdsEndpoint:        test.fmdsEndpoint,
+				ServiceAccountToken: test.token,
 			}
 			manifestPath := filepath.Join(server.RootPath, "etc", "kubernetes", "manifests", "kube-vip.yaml")
 			if test.preexisting {
@@ -207,10 +219,21 @@ func TestReconcileKubeVipConvergesManifest(t *testing.T) {
 			manifest := requireFile(t, manifestPath)
 			assert.NotContains(t, string(manifest), "super-admin.conf")
 			assert.NotContains(t, string(manifest), "/etc/kubernetes/admin.conf\n      path")
-			assertKubeVipPod(t, manifest, test.wantPeerASN)
+			assertKubeVipPod(t, manifest, test.wantPeerASN, test.token != "")
 
-			kubeconfig := requireFile(t, filepath.Join(server.RootPath, "etc", "kubernetes", "kube-vip.conf"))
-			assertCredentiallessKubeVipConfig(t, kubeconfig)
+			kubeconfigPath := filepath.Join(server.RootPath, "etc", "kubernetes", "kube-vip.conf")
+			kubeconfig := requireFile(t, kubeconfigPath)
+			info, err := os.Stat(kubeconfigPath)
+			require.NoError(t, err)
+			if test.token == "" {
+				assertCredentiallessKubeVipConfig(t, kubeconfig)
+				assert.Equal(t, os.FileMode(0o644), info.Mode().Perm())
+			} else {
+				config, err := clientcmd.Load(kubeconfig)
+				require.NoError(t, err)
+				assert.Equal(t, test.token, config.AuthInfos["kube-vip"].Token)
+				assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+			}
 
 			response, err = server.ReconcileKubeVip(context.Background(), request)
 			require.NoError(t, err)
@@ -236,7 +259,7 @@ func TestFetchKubeVipASNFromFMDSEndpoint(t *testing.T) {
 }
 
 func TestCredentiallessKubeVipConfigBuildsClient(t *testing.T) {
-	raw, err := credentiallessKubeVipConfig()
+	raw, err := kubeVipConfig("")
 	require.NoError(t, err)
 	assertCredentiallessKubeVipConfig(t, raw)
 
@@ -301,7 +324,7 @@ func assertCredentiallessKubeVipConfig(t *testing.T, raw []byte) {
 	}
 }
 
-func assertKubeVipPod(t *testing.T, manifest []byte, peerASN uint32) {
+func assertKubeVipPod(t *testing.T, manifest []byte, peerASN uint32, serviceMode bool) {
 	t.Helper()
 	var pod corev1.Pod
 	require.NoError(t, yaml.Unmarshal(manifest, &pod))
@@ -312,7 +335,15 @@ func assertKubeVipPod(t *testing.T, manifest []byte, peerASN uint32) {
 	for _, variable := range container.Env {
 		environment[variable.Name] = variable.Value
 	}
-	assert.Equal(t, "false", environment["svc_enable"])
+	if serviceMode {
+		assert.Equal(t, "true", environment["svc_enable"])
+		assert.Equal(t, "true", environment["lb_class_only"])
+		assert.Equal(t, "kube-vip.io/kube-vip-class", environment["lb_class_name"])
+	} else {
+		assert.Equal(t, "false", environment["svc_enable"])
+		assert.NotContains(t, environment, "lb_class_only")
+		assert.NotContains(t, environment, "lb_class_name")
+	}
 	assert.Empty(t, environment["vip_leaderelection"])
 	assert.Equal(t, "true", environment["bgp_enable"])
 	assert.Equal(t, "192.168.100.10", environment["address"])

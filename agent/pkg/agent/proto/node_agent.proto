@@ -65,10 +65,12 @@ service NodeAgent {
   rpc KubeadmUpgradeApply(KubeadmUpgradeApplyRequest) returns (KubeadmUpgradeApplyResponse) {}
 
   // ReconcileKubeVip atomically converges the kube-vip static-pod manifest for
-  // NVKE's active/active BGP control-plane mode. The fixed mode disables every
-  // Kubernetes API-backed kube-vip feature. For kube-vip v1.2.0 compatibility,
-  // the pod receives a kubeconfig with no client credential; this RPC never
-  // reads, creates, or mounts the host's admin.conf or super-admin.conf.
+  // NVKE's active/active BGP control-plane mode. Without a service-account
+  // token the pod receives a kubeconfig with no client credential and every
+  // Kubernetes API-backed kube-vip feature stays off. With one, kube-vip also
+  // runs in service mode, limited to Services of load balancer class
+  // kube-vip.io/kube-vip-class. This RPC never reads, creates, or mounts the
+  // host's admin.conf or super-admin.conf.
   rpc ReconcileKubeVip(ReconcileKubeVipRequest) returns (ReconcileKubeVipResponse) {}
 
   // StartKubernetesCertificateRenewal starts a V1 asynchronous control-plane
@@ -1210,6 +1212,13 @@ message ReconcileKubeVipRequest {
   // Optional absolute FMDS ASN endpoint. When empty, the legacy Forge endpoint
   // is used. Ignored unless bgp_peer_asn_source is FMDS.
   string fmds_endpoint = 7;
+  // Optional bearer token of the workload cluster's kube-system/kube-vip
+  // service account. SECRET: never log it. When set, the agent writes it into
+  // kube-vip's kubeconfig (mode 0600) and enables service mode for the
+  // kube-vip.io/kube-vip-class load balancer class. When empty, the kubeconfig
+  // carries no credential and service mode stays off, which is how the first
+  // control-plane node starts before its API server exists.
+  string service_account_token = 8;
 }
 
 message ReconcileKubeVipResponse {
@@ -1225,12 +1234,13 @@ message ReconcileKubeVipResponse {
   string bgp_interface = 3;
   string bgp_peer_address = 4;
   uint32 bgp_peer_asn = 5;
-  // Credential-less kubeconfig mounted read-only at kube-vip v1.2.0's
-  // compatibility path. It contains no token or client private key.
+  // Kubeconfig mounted read-only at kube-vip v1.2.0's compatibility path. It
+  // carries the request's service-account token, if any, and never a client
+  // private key.
   string kubeconfig_path = 6;
   // Interfaces from which a stale copy of vip_address was removed.
   repeated string cleaned_interfaces = 7;
-  // True when the credential-less kubeconfig was created or repaired.
+  // True when the kubeconfig was created or repaired.
   bool kubeconfig_changed = 8;
 }
 
