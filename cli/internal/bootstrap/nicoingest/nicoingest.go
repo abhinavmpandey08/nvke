@@ -71,8 +71,9 @@ type Config struct {
 // for each of Settings.DPUFactoryModels when one is set, and every machine of
 // the settings as an expected machine; approves measured boot for every
 // machine when the site config turns attestation on; and waits until NICo's
-// REST API reports each machine Ready or in use. The UEFI passwords are not
-// set here. Every step can be run again. When the wait times out, its error
+// REST API reports each machine Ready or in use. When REST already reports
+// every machine so, it does nothing. The UEFI passwords are not set here.
+// Every step can be run again. When the wait times out, its error
 // names the machines NICo has not discovered and those in Error.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.Settings == nil || cfg.REST == nil || cfg.Kube == nil {
@@ -92,6 +93,13 @@ func Run(ctx context.Context, cfg Config) error {
 		log = slog.Default()
 	}
 	log = log.With("component", "nicoingest")
+
+	// A machine is Ready only once NICo had its credentials and expected it, so
+	// a run resumed after the ingest finished registers nothing again.
+	if machines, err := listMachines(ctx, cfg.REST); err == nil && evaluate(cfg.Settings.Machines, machines).done() {
+		log.Info("every machine is already Ready or in use in NICo", "machines", len(cfg.Settings.Machines))
+		return nil
+	}
 
 	cli, err := openAdminCLI(ctx, cfg, log)
 	if err != nil {

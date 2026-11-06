@@ -18,8 +18,7 @@ import (
 // Load reads the settings file at path, reads the site config from its Core
 // values, and validates all of it. Unknown fields are refused, except inside
 // coreValues. handoverDir is the directory the handover bundle is written to;
-// one that already holds a bundle is refused. The error lists every problem,
-// one per line.
+// RequireNoBundle checks it. The error lists every problem, one per line.
 func Load(path, handoverDir string) (*Settings, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -81,4 +80,16 @@ func (p problems) err() error {
 		return nil
 	}
 	return errors.New(strings.Join(p, "\n"))
+}
+
+// RequireNoBundle refuses a handover directory dir that already holds a
+// handover bundle, which a new bootstrap would otherwise write over.
+func RequireNoBundle(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(dir, HandoverVaultKeysFile)); err == nil {
+		return fmt.Errorf("the handover directory %s already holds a handover bundle: move it away", dir)
+	}
+	return nil
 }

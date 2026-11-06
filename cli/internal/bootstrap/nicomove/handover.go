@@ -27,12 +27,15 @@ import (
 const (
 	handoverNamespace = "nico-system"
 	handoverConfigMap = "nvkectl-handover"
+	// stateMovedConfigMap records that NICo's databases and Vault are moved.
+	stateMovedConfigMap = "nvkectl-nico-state-moved"
 )
 
 // writeHandover writes what whoever runs the site's NICo needs beside the
 // database dumps and Vault snapshot the move already put in dir: the inputs,
 // the Helm values and chart versions NICo runs with, Vault's keys, the CAs
 // and the bundled Keycloak's admin login. Every file is private to its owner.
+// A file that exists is refused, or replaced with Config.Resume.
 func (m *mover) writeHandover(ctx context.Context, dir string, carried nicodeploy.Carried, keys nicodeploy.VaultKeys) error {
 	s := m.cfg.Site.Settings
 	inputs := filepath.Join(dir, "inputs")
@@ -46,7 +49,7 @@ func (m *mover) writeHandover(ctx context.Context, dir string, carried nicodeplo
 	if err != nil {
 		return fmt.Errorf("copying %s into the handover bundle: %w", s.Path, err)
 	}
-	if err := writePrivate(filepath.Join(inputs, "settings.yaml"), settings); err != nil {
+	if err := writePrivate(filepath.Join(inputs, "settings.yaml"), settings, m.cfg.Resume); err != nil {
 		return err
 	}
 	if err := m.site.WriteHelmValues(ctx, m.cfg.SiteKubeconfig, values); err != nil {
@@ -74,7 +77,7 @@ func (m *mover) writeHandover(ctx context.Context, dir string, carried nicodeplo
 	}
 	files["keycloak-admin.yaml"] = login
 	for name, b := range files {
-		if err := writePrivate(filepath.Join(dir, name), b); err != nil {
+		if err := writePrivate(filepath.Join(dir, name), b, m.cfg.Resume); err != nil {
 			return err
 		}
 	}
@@ -142,10 +145,16 @@ func privateDir(dir string) error {
 	return os.MkdirAll(dir, 0o700)
 }
 
-// writePrivate writes b to a new file at path, private to its owner. It never
-// overwrites a file, which may be an earlier bundle's only copy.
-func writePrivate(path string, b []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+// writePrivate writes b to a new file at path, private to its owner. Unless
+// replace is set it never overwrites a file, which may be an earlier bundle's
+// only copy; replace is for a file this bootstrap wrote itself, which may
+// have been cut short.
+func writePrivate(path string, b []byte, replace bool) error {
+	flag := os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	if replace {
+		flag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	}
+	f, err := os.OpenFile(path, flag, 0o600)
 	if err != nil {
 		return err
 	}

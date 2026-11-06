@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -34,6 +35,12 @@ type fakeEngine struct {
 	busy  int // RunningWorkflows answers busy for this many calls
 	state []nicodeploy.SiteState
 	reads int
+	// stopped is what Stopped answers; rootToken is the token VaultKeys
+	// returns, "example-token" when empty.
+	stopped   bool
+	rootToken string
+	// prepared is the Config PrepareSite was given.
+	prepared nicodeploy.Config
 }
 
 func (f *fakeEngine) record(call string) error {
@@ -58,10 +65,15 @@ func (f *fakeEngine) ReadCarried(context.Context) (nicodeploy.Carried, error) {
 }
 
 func (f *fakeEngine) VaultKeys(context.Context) (nicodeploy.VaultKeys, error) {
-	return nicodeploy.VaultKeys{UnsealKeysB64: []string{"k0", "k1", "k2"}, RootToken: "example-token"}, f.record("VaultKeys")
+	token := f.rootToken
+	if token == "" {
+		token = "example-token"
+	}
+	return nicodeploy.VaultKeys{UnsealKeysB64: []string{"k0", "k1", "k2"}, RootToken: token}, f.record("VaultKeys")
 }
 
-func (f *fakeEngine) PrepareSite(context.Context, string, string, nicodeploy.Config, nicodeploy.Carried, string) error {
+func (f *fakeEngine) PrepareSite(_ context.Context, _, _ string, cfg nicodeploy.Config, _ nicodeploy.Carried, _ string) error {
+	f.prepared = cfg
 	return f.record("PrepareSite")
 }
 
@@ -81,6 +93,8 @@ func (f *fakeEngine) RunningWorkflows(_ context.Context, _, namespace string) ([
 }
 
 func (f *fakeEngine) StopNICo(context.Context) error { return f.record("StopNICo") }
+
+func (f *fakeEngine) Stopped(context.Context) (bool, error) { return f.stopped, nil }
 
 func (f *fakeEngine) DumpDatabase(_ context.Context, _, database, path string) error {
 	if err := os.WriteFile(path, []byte("PGDMP"), 0o600); err != nil {
@@ -145,7 +159,7 @@ func testMover(t *testing.T, failOn string, before, after nicodeploy.SiteState) 
 		RemoveHostAddresses: func(context.Context) error { *log = append(*log, "host RemoveHostAddresses"); return nil },
 	}
 	seed := &fakeEngine{name: "seed", log: log, fail: failOn, busy: 2}
-	site := &fakeEngine{name: "site", log: log, fail: failOn, state: []nicodeploy.SiteState{before, before, after}}
+	site := &fakeEngine{name: "site", log: log, fail: failOn, state: []nicodeploy.SiteState{before, before, after}, rootToken: "site-token"}
 	return &mover{
 		cfg: cfg, seed: seed, site: site, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		poll: time.Millisecond, timeout: 200 * time.Millisecond,
@@ -187,6 +201,11 @@ func TestRunOrder(t *testing.T) {
 	}, *log)
 
 	ctx := context.Background()
+	restored := m.site.(*fakeEngine).prepared.RestoredVaultKeys
+	require.NotNil(t, restored, "the site may open its Vault with the bootstrap cluster's keys")
+	assert.Equal(t, "example-token", restored.RootToken)
+	_, err = m.cfg.SiteKube.CoreV1().ConfigMaps(handoverNamespace).Get(ctx, stateMovedConfigMap, metav1.GetOptions{})
+	require.NoError(t, err, "the site records that the databases and Vault moved")
 	capnico, err := m.cfg.SiteKube.AppsV1().Deployments(capnicoNamespace).Get(ctx, capnicoDeployment, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), *capnico.Spec.Replicas, "CAPNICo runs again, with the replicas it had")
@@ -248,6 +267,8 @@ func TestRunStopsAtTheFirstFailure(t *testing.T) {
 	assert.Equal(t, int32(0), *capnico.Spec.Replicas, "CAPNICo starts no work against a NICo that is not moved")
 	_, err = m.cfg.SiteKube.CoreV1().ConfigMaps(handoverNamespace).Get(context.Background(), handoverConfigMap, metav1.GetOptions{})
 	assert.Error(t, err, "the site is not marked handed over")
+	_, err = m.cfg.SiteKube.CoreV1().ConfigMaps(handoverNamespace).Get(context.Background(), stateMovedConfigMap, metav1.GetOptions{})
+	assert.Error(t, err, "a Vault restore that failed is not recorded as moved")
 }
 
 func TestVerify(t *testing.T) {
@@ -302,4 +323,95 @@ func TestDrainNamesWhatStillRuns(t *testing.T) {
 func TestRunValidatesConfig(t *testing.T) {
 	_, err := Run(context.Background(), Config{SeedKubeconfig: "seed"})
 	assert.Error(t, err)
+}
+
+func TestRunResumes(t *testing.T) {
+	before, after := states()
+	moveState := []string{
+		"seed DumpDatabase nico_system_nico", "site RestoreDatabase nico_system_nico",
+		"seed DumpDatabase nico_rest", "site RestoreDatabase nico_rest",
+		"seed DumpDatabase keycloak", "site RestoreDatabase keycloak",
+		"seed SnapshotVault", "site RestoreVault",
+	}
+	stop := []string{"seed ScaleRESTAPI 0", "seed RunningWorkflows idle", "seed StopNICo"}
+	tests := []struct {
+		name string
+		// prepare sets up what an earlier run left.
+		prepare  func(t *testing.T, m *mover)
+		wantNone bool
+		skipped  []string
+		ran      []string
+	}{
+		{
+			name: "the site is already handed over",
+			prepare: func(t *testing.T, m *mover) {
+				_, err := m.cfg.SiteKube.CoreV1().ConfigMaps(handoverNamespace).Create(context.Background(),
+					&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: handoverNamespace, Name: handoverConfigMap}}, metav1.CreateOptions{})
+				require.NoError(t, err)
+			},
+			wantNone: true,
+		},
+		{
+			name:    "the bootstrap cluster's NICo is already stopped",
+			prepare: func(_ *testing.T, m *mover) { m.seed.(*fakeEngine).stopped = true },
+			skipped: stop,
+			ran:     append([]string{"site PrepareSite"}, moveState...),
+		},
+		{
+			name: "the databases and Vault are already moved",
+			prepare: func(t *testing.T, m *mover) {
+				m.seed.(*fakeEngine).stopped = true
+				_, err := m.cfg.SiteKube.CoreV1().ConfigMaps(handoverNamespace).Create(context.Background(),
+					&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: handoverNamespace, Name: stateMovedConfigMap}}, metav1.CreateOptions{})
+				require.NoError(t, err)
+			},
+			skipped: append(slices.Clone(stop), moveState...),
+			ran:     []string{"site PrepareSite", "host RemoveHostAddresses", "site PublishSite", "site StartSite"},
+		},
+		{
+			// The site's Vault holds the bootstrap cluster's keys, but the restore stopped before restarting Vault.
+			name: "the Vault restore stopped after storing the keys",
+			prepare: func(_ *testing.T, m *mover) {
+				m.seed.(*fakeEngine).stopped = true
+				m.site.(*fakeEngine).rootToken = "example-token"
+			},
+			skipped: stop,
+			ran:     append([]string{"site PrepareSite"}, moveState...),
+		},
+		{
+			name: "the handover bundle was partly written",
+			prepare: func(t *testing.T, m *mover) {
+				m.cfg.Resume = true
+				dir := m.cfg.Site.Settings.HandoverDir
+				require.NoError(t, os.MkdirAll(filepath.Join(dir, "inputs"), 0o700))
+				require.NoError(t, os.WriteFile(filepath.Join(dir, nicosettings.HandoverVaultKeysFile), []byte("cut sh"), 0o600))
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "inputs", "settings.yaml"), []byte("cut"), 0o600))
+			},
+			ran: append(append([]string{"site PrepareSite"}, stop...), moveState...),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, log := testMover(t, "", before, after)
+			tt.prepare(t, m)
+			_, err := m.run(context.Background())
+			require.NoError(t, err)
+			if tt.wantNone {
+				assert.Empty(t, *log, "a handed-over NICo is left as it is")
+				return
+			}
+			for _, call := range tt.skipped {
+				assert.NotContains(t, *log, call)
+			}
+			for _, call := range tt.ran {
+				assert.Contains(t, *log, call)
+			}
+			dir := m.cfg.Site.Settings.HandoverDir
+			keys, err := os.ReadFile(filepath.Join(dir, nicosettings.HandoverVaultKeysFile))
+			require.NoError(t, err)
+			assert.Contains(t, string(keys), "example-token", "the bundle holds the bootstrap cluster's Vault keys")
+			_, err = m.cfg.SiteKube.CoreV1().ConfigMaps(handoverNamespace).Get(context.Background(), handoverConfigMap, metav1.GetOptions{})
+			assert.NoError(t, err, "the site is marked handed over")
+		})
+	}
 }

@@ -81,6 +81,9 @@ type managedNico struct {
 	seedKube kubernetes.Interface
 	// withdrawn are the service addresses already taken off the bootstrap host.
 	withdrawn []string
+	// vipHeld is set while a resumed run keeps the control-plane VIP off the
+	// bootstrap host until it knows whether the site cluster was requested.
+	vipHeld bool
 }
 
 // loadManagedNico loads the NICo settings infra.nico.managed names and the
@@ -109,15 +112,6 @@ func loadManagedNico(inv *sitespec.SiteSpec) (*managedNico, error) {
 	for _, login := range secrets.BMCLogins {
 		redact.RegisterSecret(login.Password)
 	}
-	if have, want := len(settings.Machines), inv.ControlPlaneCount(); have < want {
-		return nil, fmt.Errorf("NICo settings %s: machines lists %d hosts, fewer than the %d infra.nico.controlPlane.count asks for",
-			path, have, want)
-	}
-	// Vault's chart runs one replica per node, and the site cluster's nodes are its control plane.
-	if replicas, nodes := settings.EffectiveSiteReplicas(), inv.ControlPlaneCount(); replicas > nodes {
-		return nil, fmt.Errorf("NICo settings %s: site.replicas is %d, more than the site cluster's %d nodes (infra.nico.controlPlane.count); "+
-			"set site.replicas to at most %d", path, replicas, nodes, nodes)
-	}
 	vip, _ := netip.ParseAddr(inv.Cluster.ControlPlaneVIP)
 	return &managedNico{settings: settings, secrets: secrets, vip: vip, bgpDir: inv.ResolvePath(inv.ClusterName + "-nico-bgp")}, nil
 }
@@ -137,9 +131,18 @@ func (n *managedNico) sharesVIP() bool {
 	return n.vip.IsValid() && (a.RESTEndpoint().Addr() == n.vip || a.KeycloakEndpoint().Addr() == n.vip)
 }
 
+// capnicoInCluster reports whether CAPNICo on the bootstrap cluster reaches
+// NICo by its in-cluster endpoints: once the control-plane VIP that REST or
+// Keycloak shares is off the bootstrap host, nothing may depend on it there.
+func (n *managedNico) capnicoInCluster() bool {
+	return n.sharesVIP() && !slices.Contains(n.announced(), n.vip.String())
+}
+
 // announced returns the service addresses the bootstrap host still holds.
 func (n *managedNico) announced() []string {
-	return slices.DeleteFunc(n.addresses(), func(a string) bool { return slices.Contains(n.withdrawn, a) })
+	return slices.DeleteFunc(n.addresses(), func(a string) bool {
+		return slices.Contains(n.withdrawn, a) || (n.vipHeld && a == n.vip.String())
+	})
 }
 
 // bgpConfig returns the speaker's configuration, announcing what announced returns.
@@ -155,10 +158,15 @@ func (n *managedNico) bgpConfig() seedbgp.Config {
 // announce announces the service addresses from the bootstrap host over BGP
 // and waits for a session with a router to come up. A resumed run first
 // reads which addresses an earlier run withdrew, takes them off the host, and
-// puts back the others, which the host may have lost.
+// puts back the others, which the host may have lost. With siteRequested, the
+// controller has accepted the site cluster, whose kube-vip announces the
+// control-plane VIP, so the VIP counts as withdrawn even when the earlier run
+// stopped before recording it. With requestUnknown, whether it was accepted is
+// not known yet, so the VIP is held off the host until settleVIP. With
+// nothing left to announce, the speaker is stopped.
 func (n *managedNico) announce(
 	ctx context.Context,
-	adopted bool,
+	adopted, siteRequested, requestUnknown bool,
 	bootstrapCluster, kubeconfig string,
 	hostRunner bootstrapengine.CommandRunner,
 	logger *slog.Logger,
@@ -179,7 +187,24 @@ func (n *managedNico) announce(
 		default:
 			n.withdrawn = strings.Fields(cm.Data[withdrawnKey])
 		}
-		if err := removeHostAddresses(ctx, hostRunner, n.withdrawn, logger); err != nil {
+		vip := n.vip.String()
+		if n.sharesVIP() && !slices.Contains(n.withdrawn, vip) {
+			switch {
+			case siteRequested:
+				logger.Info("the site cluster was requested before the control-plane VIP was withdrawn from the bootstrap host; withdrawing it now",
+					"vip", vip)
+				if err := n.recordWithdrawn(ctx, []string{vip}); err != nil {
+					return err
+				}
+			case requestUnknown:
+				n.vipHeld = true
+			}
+		}
+		off := n.withdrawn
+		if n.vipHeld {
+			off = append(slices.Clone(off), vip)
+		}
+		if err := removeHostAddresses(ctx, hostRunner, off, logger); err != nil {
 			return err
 		}
 		if err := ensureHostAddresses(ctx, hostRunner, n.announced(), logger); err != nil {
@@ -201,7 +226,32 @@ func (n *managedNico) announce(
 	}
 	if len(n.announced()) == 0 {
 		logger.Info("NICo's service addresses were withdrawn from the bootstrap host by an earlier run; not announcing them")
+		// An earlier run may have stopped between recording the withdrawal and stopping the speaker.
+		return n.speaker.Stop(ctx, n.bgp)
+	}
+	return n.speaker.Start(ctx, n.bgpConfig())
+}
+
+// settleVIP ends the hold announce put on the control-plane VIP once the
+// controller answers. With requested, the site cluster was requested, so the
+// VIP is recorded as withdrawn, as withdrawVIP records it; otherwise it goes
+// back on the bootstrap host and into the speaker. Without a hold it does
+// nothing.
+func (n *managedNico) settleVIP(ctx context.Context, requested bool, hostRunner bootstrapengine.CommandRunner, logger *slog.Logger) error {
+	if !n.vipHeld {
 		return nil
+	}
+	if requested {
+		if err := n.recordWithdrawn(ctx, []string{n.vip.String()}); err != nil {
+			return err
+		}
+		n.vipHeld = false
+		return nil
+	}
+	n.vipHeld = false
+	logger.Info("the site cluster was not requested yet; announcing the control-plane VIP from the bootstrap host", "vip", n.vip.String())
+	if err := ensureHostAddresses(ctx, hostRunner, []string{n.vip.String()}, logger); err != nil {
+		return err
 	}
 	return n.speaker.Start(ctx, n.bgpConfig())
 }
@@ -279,6 +329,17 @@ func (n *managedNico) withdrawAll(ctx context.Context, hostRunner bootstrapengin
 	return removeHostAddresses(ctx, hostRunner, n.addresses(), logger)
 }
 
+// release stops the BGP speaker and takes the service addresses off the
+// bootstrap host, when the bootstrap cluster that serves them is deleted.
+func (n *managedNico) release(ctx context.Context, hostRunner bootstrapengine.CommandRunner, logger *slog.Logger) error {
+	if n.speaker != nil {
+		if err := n.speaker.Stop(ctx, n.bgp); err != nil {
+			return err
+		}
+	}
+	return removeHostAddresses(ctx, hostRunner, n.addresses(), logger)
+}
+
 // addresses returns the service addresses published on the bootstrap host, in
 // the order SeedPortMappings lists them.
 func (n *managedNico) addresses() []string {
@@ -298,13 +359,19 @@ func (n *managedNico) removeSource() {
 	}
 }
 
-// install installs NICo in the bootstrap cluster from the release the
-// bootstrap manifest pins, and sets NICo's client credentials on cweCfg, so the
-// NVKE stack installs CAPNICo with them.
+// install fetches the NICo source release the bootstrap manifest pins and
+// installs NICo in the bootstrap cluster from it, and sets NICo's client
+// credentials on cweCfg, so the NVKE stack installs CAPNICo with them: the
+// in-cluster endpoints once the control-plane VIP that REST or Keycloak shares
+// is off the bootstrap host, the published ones before. With
+// installed, an earlier run of this bootstrap installed NICo, and the site
+// cluster or the move may since depend on it as it is: it is read back
+// instead, and nothing in the bootstrap cluster is changed.
 func (n *managedNico) install(
 	ctx context.Context,
 	kubeconfig string,
 	cweCfg *controllerdeploy.Config,
+	installed bool,
 	runner controllerdeploy.CommandRunner,
 	logger *slog.Logger,
 ) error {
@@ -323,7 +390,13 @@ func (n *managedNico) install(
 	}
 	n.seed = nicodeploy.NewConfig(n.settings, n.secrets, nicodeploy.ProfileSeed, bootstrapStorageClass)
 	n.seed.Dial = n.dial
-	if n.inst, err = nicodeploy.New(runner, kube, logger).Install(ctx, kubeconfig, n.root, n.seed); err != nil {
+	engine := nicodeploy.New(runner, kube, logger)
+	if installed {
+		logger.Info("NICo is already installed in the bootstrap cluster; reading it back")
+		if n.inst, err = engine.Installed(ctx, n.seed); err != nil {
+			return fmt.Errorf("reading the NICo an earlier run installed: %w", err)
+		}
+	} else if n.inst, err = engine.Install(ctx, kubeconfig, n.root, n.seed); err != nil {
 		return fmt.Errorf("installing NICo: %w", err)
 	}
 	cweCfg.CAPNICo = controllerdeploy.CAPNICoAccess{
@@ -334,33 +407,33 @@ func (n *managedNico) install(
 		ClientID:     n.inst.Credentials.ClientID,
 		ClientSecret: n.inst.Credentials.ClientSecret,
 	}
+	if n.capnicoInCluster() {
+		cweCfg.CAPNICo.Endpoint, cweCfg.CAPNICo.TokenURL = nicodeploy.InClusterRESTEndpoint, nicodeploy.InClusterTokenURL
+	}
 	return nil
 }
 
 // configure ingests the site's machines into the installed NICo, creates the
 // objects CAPNICo allocates the control plane with, and points the site spec
-// at them, so the create request carries their IDs.
+// at them, so the create request carries their IDs. With siteRequested, the
+// site cluster already holds machines, so none is ingested, and the objects
+// are only found.
 func (n *managedNico) configure(
 	ctx context.Context,
 	inv *sitespec.SiteSpec,
 	kubeconfig string,
+	siteRequested bool,
 	runner controllerdeploy.CommandRunner,
 	logger *slog.Logger,
 ) error {
-	// The stack install just applied CAPNICo's published endpoints again; a run
-	// resumed after the VIP was withdrawn points it back at the in-cluster ones.
-	if n.vip.IsValid() && slices.Contains(n.withdrawn, n.vip.String()) {
-		if err := controllerdeploy.New(runner, logger).
-			SetCAPNICoEndpoints(ctx, kubeconfig, nicodeploy.InClusterRESTEndpoint, nicodeploy.InClusterTokenURL); err != nil {
-			return err
-		}
-	}
 	kube, err := untaint.NewClient(kubeconfig)
 	if err != nil {
 		return err
 	}
 	rest := n.inst.REST()
-	if err := nicoingest.Run(ctx, nicoingest.Config{
+	if siteRequested {
+		logger.Info("the site cluster was already requested; not ingesting the site's machines again")
+	} else if err := nicoingest.Run(ctx, nicoingest.Config{
 		Kubeconfig: kubeconfig,
 		Settings:   n.settings,
 		Secrets:    n.secrets,
@@ -435,9 +508,11 @@ func pointAtNico(inv *sitespec.SiteSpec, inst *nicodeploy.Installed, res *nicoal
 
 // move moves NICo from the bootstrap cluster onto the site cluster and writes
 // its handover bundle. It withdraws the service addresses from the bootstrap
-// host once the site is ready to hold them.
+// host once the site is ready to hold them. With resume, it continues a move
+// an earlier run of this bootstrap started; see nicomove.Run.
 func (n *managedNico) move(
 	ctx context.Context,
+	resume bool,
 	seedKubeconfig, siteKubeconfig string,
 	runner controllerdeploy.CommandRunner,
 	hostRunner bootstrapengine.CommandRunner,
@@ -470,6 +545,7 @@ func (n *managedNico) move(
 			return n.withdrawAll(ctx, hostRunner, logger)
 		},
 		Logger: logger,
+		Resume: resume,
 	})
 	return err
 }

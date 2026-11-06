@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -58,6 +60,9 @@ type Config struct {
 	RemoveHostAddresses func(context.Context) error
 	// Logger receives progress; slog.Default when nil.
 	Logger *slog.Logger
+	// Resume continues a move an earlier run of the same bootstrap started: the
+	// files it wrote to the handover directory are replaced instead of refused.
+	Resume bool
 }
 
 // engine is what Run does on one cluster's NICo. *nicodeploy.Engine is one.
@@ -68,6 +73,7 @@ type engine interface {
 	ScaleRESTAPI(ctx context.Context, replicas int) error
 	RunningWorkflows(ctx context.Context, kubeconfig, namespace string) ([]string, error)
 	StopNICo(ctx context.Context) error
+	Stopped(ctx context.Context) (bool, error)
 	DumpDatabase(ctx context.Context, kubeconfig, database, path string) error
 	RestoreDatabase(ctx context.Context, kubeconfig, database, path string) error
 	SnapshotVault(ctx context.Context, kubeconfig, path string) error
@@ -90,6 +96,15 @@ var _ engine = (*nicodeploy.Engine)(nil)
 // reports and the machines kept their status. It then writes the handover bundle to Site.Settings.HandoverDir and
 // the ConfigMap nico-system/nvkectl-handover. The bootstrap cluster's NICo is
 // left stopped, with its state, so a failed move can be recovered from it.
+//
+// Run can be run again after a move that stopped part of the way. It returns
+// nil without doing anything when the site cluster already holds
+// nvkectl-handover. It does not stop the bootstrap cluster's NICo again once
+// it is stopped, and does not move the databases and Vault again once the
+// site cluster holds the ConfigMap nico-system/nvkectl-nico-state-moved,
+// written when their move finished: from then on the site's copies are the
+// ones NICo may have written to. Until then the site's NICo has not started,
+// so the move is redone. Every other step is an upgrade or a check.
 func Run(ctx context.Context, cfg Config) (*nicodeploy.Installed, error) {
 	if cfg.SeedKubeconfig == "" || cfg.SiteKubeconfig == "" || cfg.Root == "" || cfg.SiteID == "" {
 		return nil, errors.New("nicomove: SeedKubeconfig, SiteKubeconfig, Root and SiteID are required")
@@ -131,6 +146,9 @@ type mover struct {
 
 func (m *mover) run(ctx context.Context) (*nicodeploy.Installed, error) {
 	c := m.cfg
+	if done, err := m.handedOver(ctx); err != nil || done {
+		return nil, err
+	}
 	dir := c.Site.Settings.HandoverDir
 	dumps := filepath.Join(dir, "databases")
 	for _, d := range []string{dir, dumps} {
@@ -148,7 +166,10 @@ func (m *mover) run(ctx context.Context) (*nicodeploy.Installed, error) {
 	}
 
 	m.log.Info("preparing the site cluster for NICo")
-	if err := m.site.PrepareSite(ctx, c.SiteKubeconfig, c.Root, c.Site, carried, c.SiteID); err != nil {
+	// An earlier run may have restored the bootstrap cluster's Vault on the site and stopped before storing its keys.
+	site := c.Site
+	site.RestoredVaultKeys = &keys
+	if err := m.site.PrepareSite(ctx, c.SiteKubeconfig, c.Root, site, carried, c.SiteID); err != nil {
 		return nil, err
 	}
 	// CAPNICo and REST's API start every NICo workflow.
@@ -160,31 +181,25 @@ func (m *mover) run(ctx context.Context) (*nicodeploy.Installed, error) {
 	if err := m.scaleCAPNICo(ctx, 0); err != nil {
 		return nil, err
 	}
-	if err := m.seed.ScaleRESTAPI(ctx, 0); err != nil {
+	stopped, err := m.seed.Stopped(ctx)
+	if err != nil {
 		return nil, err
 	}
-	if err := m.drain(ctx); err != nil {
-		return nil, err
-	}
-	if err := m.seed.StopNICo(ctx); err != nil {
-		return nil, err
+	if stopped {
+		m.log.Info("the bootstrap cluster's NICo is already stopped")
+	} else {
+		if err := m.seed.ScaleRESTAPI(ctx, 0); err != nil {
+			return nil, err
+		}
+		if err := m.drain(ctx); err != nil {
+			return nil, err
+		}
+		if err := m.seed.StopNICo(ctx); err != nil {
+			return nil, err
+		}
 	}
 
-	m.log.Info("moving NICo's databases and Vault to the site cluster")
-	for _, db := range nicodeploy.Databases {
-		path := filepath.Join(dumps, db+".dump")
-		if err := m.seed.DumpDatabase(ctx, c.SeedKubeconfig, db, path); err != nil {
-			return nil, err
-		}
-		if err := m.site.RestoreDatabase(ctx, c.SiteKubeconfig, db, path); err != nil {
-			return nil, err
-		}
-	}
-	snapshot := filepath.Join(dir, "vault.snap")
-	if err := m.seed.SnapshotVault(ctx, c.SeedKubeconfig, snapshot); err != nil {
-		return nil, err
-	}
-	if err := m.site.RestoreVault(ctx, c.SiteKubeconfig, c.Root, c.Site, snapshot, keys); err != nil {
+	if err := m.moveState(ctx, dir, dumps, keys); err != nil {
 		return nil, err
 	}
 	before, err := m.site.SiteState(ctx, c.SiteKubeconfig, c.SiteID)
@@ -221,6 +236,58 @@ func (m *mover) run(ctx context.Context) (*nicodeploy.Installed, error) {
 	}
 	m.log.Info("NICo is moved to the site cluster and handed over", "siteID", c.SiteID, "handover", dir)
 	return inst, nil
+}
+
+// handedOver reports whether the site cluster holds the marker of a NICo
+// already handed over.
+func (m *mover) handedOver(ctx context.Context) (bool, error) {
+	_, err := m.cfg.SiteKube.CoreV1().ConfigMaps(handoverNamespace).Get(ctx, handoverConfigMap, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("reading ConfigMap %s/%s: %w", handoverNamespace, handoverConfigMap, err)
+	}
+	m.log.Info("NICo on the site cluster is already handed over", "configMap", handoverNamespace+"/"+handoverConfigMap)
+	return true, nil
+}
+
+// moveState moves NICo's databases and Vault from the stopped bootstrap
+// cluster's NICo to the site cluster and records that on the site cluster,
+// unless it is recorded already: the site's NICo may have written to them since.
+func (m *mover) moveState(ctx context.Context, dir, dumps string, keys nicodeploy.VaultKeys) error {
+	c := m.cfg
+	configMaps := c.SiteKube.CoreV1().ConfigMaps(handoverNamespace)
+	_, err := configMaps.Get(ctx, stateMovedConfigMap, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		m.log.Info("NICo's databases and Vault are already on the site cluster")
+		return nil
+	case !apierrors.IsNotFound(err):
+		return fmt.Errorf("reading ConfigMap %s/%s: %w", handoverNamespace, stateMovedConfigMap, err)
+	}
+	m.log.Info("moving NICo's databases and Vault to the site cluster")
+	for _, db := range nicodeploy.Databases {
+		path := filepath.Join(dumps, db+".dump")
+		if err := m.seed.DumpDatabase(ctx, c.SeedKubeconfig, db, path); err != nil {
+			return err
+		}
+		if err := m.site.RestoreDatabase(ctx, c.SiteKubeconfig, db, path); err != nil {
+			return err
+		}
+	}
+	snapshot := filepath.Join(dir, "vault.snap")
+	if err := m.seed.SnapshotVault(ctx, c.SeedKubeconfig, snapshot); err != nil {
+		return err
+	}
+	if err := m.site.RestoreVault(ctx, c.SiteKubeconfig, c.Root, c.Site, snapshot, keys); err != nil {
+		return err
+	}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: handoverNamespace, Name: stateMovedConfigMap}}
+	if _, err := configMaps.Create(ctx, cm, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("writing ConfigMap %s/%s: %w", handoverNamespace, stateMovedConfigMap, err)
+	}
+	return nil
 }
 
 // publishSite publishes NICo's service addresses on the site cluster. It runs

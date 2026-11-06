@@ -124,6 +124,46 @@ func (e *Engine) Install(ctx context.Context, kubeconfig, root string, cfg Confi
 	return inst, nil
 }
 
+// Installed returns how the NICo an earlier Install put on the cluster is
+// reached, as cfg describes it, without installing or changing anything: the
+// site ID its site agent runs with and the client credentials of its bundled
+// Keycloak. It fails when NICo has no registered site or no Keycloak login.
+func (e *Engine) Installed(ctx context.Context, cfg Config) (*Installed, error) {
+	if cfg.Settings == nil {
+		return nil, errors.New("nicodeploy: Settings is required to read the installed NICo")
+	}
+	siteID, err := e.priorSiteID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if siteID == "" {
+		return nil, fmt.Errorf("NICo has no registered site: ConfigMap %s/%s holds no site ID", restNamespace, siteAgentConfigMap)
+	}
+	secret, err := e.kube.CoreV1().Secrets(restNamespace).Get(ctx, keycloakLoginSecret, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("reading Secret %s/%s: %w", restNamespace, keycloakLoginSecret, err)
+	}
+	login := &keycloakLogin{
+		AdminPassword: string(secret.Data["admin-password"]),
+		ServiceSecret: string(secret.Data["ncx-service-secret"]),
+		RESTSecret:    string(secret.Data["nico-rest-secret"]),
+	}
+	if login.ServiceSecret == "" {
+		return nil, fmt.Errorf("the Keycloak login %s/%s holds no ncx-service-secret", restNamespace, keycloakLoginSecret)
+	}
+	for _, secret := range []string{login.AdminPassword, login.ServiceSecret, login.RESTSecret} {
+		redact.RegisterSecret(secret)
+	}
+	return &Installed{
+		SiteID:       siteID,
+		RESTEndpoint: restEndpoint(cfg.Settings),
+		OrgID:        cfg.Settings.EffectiveOrgID(),
+		APIName:      nicorest.DefaultAPIName,
+		Credentials:  clientCredentials(cfg, login),
+		Dial:         cfg.Dial,
+	}, nil
+}
+
 // installREST installs NICo REST with what it runs on: its CA and issuer, the
 // identity provider and Temporal. It returns the OAuth2 client nvkectl and
 // CAPNICo fetch tokens with.

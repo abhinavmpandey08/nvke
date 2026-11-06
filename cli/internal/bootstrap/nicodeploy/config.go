@@ -63,6 +63,11 @@ type Config struct {
 	// ProfileSite, REST or Keycloak on this address is published on a node
 	// port of the VIP.
 	ControlPlaneVIP string
+	// RestoredVaultKeys are the keys of the Vault whose snapshot a move
+	// restores into this cluster's Vault. When the stored keys do not open
+	// Vault, because a move restored the snapshot and stopped before storing
+	// these, they are tried, and stored in place of the others once they open it.
+	RestoredVaultKeys *VaultKeys
 	// siteRootCarried is set when the site root CA was copied from the
 	// bootstrap cluster, so the prerequisites use it instead of issuing one.
 	siteRootCarried bool

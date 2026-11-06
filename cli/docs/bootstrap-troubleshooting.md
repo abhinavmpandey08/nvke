@@ -288,6 +288,30 @@ run. Once the pivot has started that controller may be stopped, and only
 `cluster.controlPlaneVIP` is compared, with the site cluster's kubeconfig. Without a bootstrap cluster there is
 nothing to continue, and `--resume` starts a new bootstrap.
 
+With `infra.nico.managed`, the NICo stages are continued the same way:
+
+- **Install.** Helm releases are upgraded in place. An initialized Vault is
+  opened with the keys in `vault/vault-cluster-keys` and never initialized again.
+  The Keycloak secrets, the database passwords and the site ID are reused.
+  Once the site cluster has been requested, NICo is read back, not reinstalled.
+- **Ingest.** Skipped when NICo already reports every machine Ready or in use,
+  and once the site cluster has been requested.
+- **Control-plane objects.** The instance type, allocations, VPC, subnet or
+  VPC prefix, and SSH key group are found by name, not created again.
+- **Control-plane VIP.** When REST or Keycloak shares the VIP and the site
+  cluster has been requested, the VIP stays off the bootstrap host, even if
+  the earlier run stopped before withdrawing it. When the controller does not
+  answer yet, the VIP is kept off until it does.
+- **Move.** The move is done once the site cluster holds ConfigMap
+  `nico-system/nvkectl-handover`. Until then, a bootstrap NICo that is already
+  stopped is not stopped again. Once the site's Vault opens with the bootstrap
+  cluster's keys, the databases and Vault are not moved again. Every other
+  step is repeated, and the handover bundle in `<clusterName>-nico-handover`
+  is rewritten.
+
+A new run, including `--resume` without a bootstrap cluster, still refuses a
+handover directory that already holds a bundle.
+
 #### Delete the cluster
 
 When it is safe to delete it, which with `nico` is after the instances are

@@ -330,8 +330,16 @@ func (e *Engine) unsealVault(ctx context.Context, kubeconfig string, cfg Config)
 			"or reinstall Vault with its volumes deleted", err, vaultNamespace, vaultKeysSecret)
 	}
 	for _, pod := range pods {
-		if err := e.unsealPod(ctx, kubeconfig, pod, keys, cfg.Timeout); err != nil {
+		opened, err := e.unsealPod(ctx, kubeconfig, pod, keys, cfg.RestoredVaultKeys, cfg.Timeout)
+		if err != nil {
 			return "", err
+		}
+		if opened.RootToken != keys.RootToken {
+			e.log.Info("Vault opened with the keys of the Vault a move restored into it; storing them", "pod", pod)
+			if err := e.storeVaultKeys(ctx, opened, cfg.Timeout); err != nil {
+				return "", err
+			}
+			keys = opened
 		}
 	}
 
@@ -436,15 +444,18 @@ func saveVaultInit(cfg Config, body []byte) (string, error) {
 	return f.Name(), nil
 }
 
-// unsealPod unseals pod with the threshold of keys. The keys reach the pod in
-// vaultScript's script and Vault reads each from stdin, so none is on a
-// command line.
-func (e *Engine) unsealPod(ctx context.Context, kubeconfig, pod string, keys VaultKeys, timeout time.Duration) error {
-	script := "set -e\n"
-	for _, key := range keys.UnsealKeysB64[:vaultKeyThreshold] {
-		script += "vault write -tls-skip-verify sys/unseal key=-" + heredoc(key)
+// unsealPod unseals pod with the threshold of keys and returns the keys that
+// opened it: keys when it was not sealed. With restored, the keys of a
+// snapshot a move may have restored into Vault, attempts alternate between
+// the two. The keys reach the pod in vaultScript's script and Vault reads
+// each from stdin, so none is on a command line.
+func (e *Engine) unsealPod(ctx context.Context, kubeconfig, pod string, keys VaultKeys, restored *VaultKeys, timeout time.Duration) (VaultKeys, error) {
+	sets := []VaultKeys{keys}
+	if restored != nil && restored.complete() && restored.RootToken != keys.RootToken {
+		sets = append(sets, *restored)
 	}
-	return e.until(ctx, timeout, pod+" to be unsealed", func(ctx context.Context) (bool, error) {
+	opened, attempt := keys, 0
+	err := e.until(ctx, timeout, pod+" to be unsealed", func(ctx context.Context) (bool, error) {
 		s, err := e.vaultStatus(ctx, kubeconfig, pod)
 		if err != nil {
 			return false, nil
@@ -452,11 +463,18 @@ func (e *Engine) unsealPod(ctx context.Context, kubeconfig, pod string, keys Vau
 		if !s.Sealed {
 			return true, nil
 		}
+		opened = sets[attempt%len(sets)]
+		attempt++
+		script := "set -e\n"
+		for _, key := range opened.UnsealKeysB64[:vaultKeyThreshold] {
+			script += "vault write -tls-skip-verify sys/unseal key=-" + heredoc(key)
+		}
 		if err := e.vaultScript(ctx, kubeconfig, pod, "vault write sys/unseal", script); err != nil {
 			e.log.Warn("unsealing Vault failed; retrying", "pod", pod, "err", err)
 		}
 		return false, nil
 	})
+	return opened, err
 }
 
 // redact registers k's keys and token, so no log or printed error shows them.
@@ -479,6 +497,26 @@ func (e *Engine) VaultKeys(ctx context.Context) (VaultKeys, error) {
 	}
 	keys.redact()
 	return keys, nil
+}
+
+// storeVaultKeys stores keys in place of the installed Vault's. Vault opens
+// with them only, so the write is retried until timeout.
+func (e *Engine) storeVaultKeys(ctx context.Context, keys VaultKeys, timeout time.Duration) error {
+	body, err := json.Marshal(keys)
+	if err != nil {
+		return err
+	}
+	stored := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: vaultNamespace, Name: vaultKeysSecret},
+		Data:       map[string][]byte{vaultKeysKey: body},
+	}
+	return e.until(ctx, timeout, "Vault's keys to be stored", func(ctx context.Context) (bool, error) {
+		err := e.applySecret(ctx, stored)
+		if err != nil {
+			e.log.Warn("storing Vault's keys failed; retrying", "err", err)
+		}
+		return err == nil, nil
+	})
 }
 
 func (k VaultKeys) complete() bool {

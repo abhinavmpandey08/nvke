@@ -40,6 +40,8 @@ type fakeVault struct {
 	unseals     map[string]int
 	inits       int
 	lines       []string
+	// opens, when set, are the only unseal keys that count.
+	opens map[string]bool
 }
 
 func (v *fakeVault) Run(_ context.Context, _ string, args ...string) (string, error) {
@@ -57,7 +59,12 @@ func (v *fakeVault) Run(_ context.Context, _ string, args ...string) (string, er
 				return "", err
 			}
 			pod, _, _ = strings.Cut(args[i+4], ":")
-			v.unseals[pod] += strings.Count(string(script), "vault write -tls-skip-verify sys/unseal key=-")
+			lines := strings.Split(string(script), "\n")
+			for j, l := range lines {
+				if strings.HasPrefix(l, "vault write -tls-skip-verify sys/unseal key=-") && (v.opens == nil || v.opens[lines[j+1]]) {
+					v.unseals[pod]++
+				}
+			}
 			return "", nil
 		}
 	}
@@ -132,6 +139,31 @@ func TestUnsealVault(t *testing.T) {
 			assert.Equal(t, prereqsRelease, ns.Annotations["meta.helm.sh/release-name"], "nico-prereqs can adopt its namespace")
 		})
 	}
+}
+
+// TestUnsealVaultWithRestoredKeys: a move that restored another Vault's
+// snapshot and stopped before storing that Vault's keys leaves Vault opening
+// only with them; the unseal falls back to them and stores them.
+func TestUnsealVaultWithRestoredKeys(t *testing.T) {
+	kube := fake.NewClientset()
+	vault := &fakeVault{initialized: true, unseals: map[string]int{}, opens: map[string]bool{"k0": true, "k1": true, "k2": true}}
+	e := New(vault, kube, discardLog())
+	e.poll = time.Millisecond
+	ctx := context.Background()
+	require.NoError(t, e.storeVaultKeys(ctx, VaultKeys{UnsealKeysB64: []string{"s0", "s1", "s2"}, RootToken: "site-token"}, time.Second))
+	restored := VaultKeys{UnsealKeysB64: []string{"k0", "k1", "k2"}, RootToken: "root-token"}
+	cfg := Config{Replicas: 2, Timeout: time.Second, RestoredVaultKeys: &restored}
+
+	token, err := e.unsealVault(ctx, "kubeconfig", cfg)
+	require.NoError(t, err)
+	assert.Equal(t, "root-token", token)
+	stored, err := e.VaultKeys(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, restored, stored, "the keys that opened Vault are stored")
+
+	vault.unseals = map[string]int{}
+	_, err = e.unsealVault(ctx, "kubeconfig", Config{Replicas: 1, Timeout: 50 * time.Millisecond})
+	require.NoError(t, err, "a later unseal opens Vault with the stored keys alone")
 }
 
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

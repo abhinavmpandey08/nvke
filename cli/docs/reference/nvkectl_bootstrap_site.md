@@ -57,7 +57,12 @@ working directory, plus --resume. Each step checks what the bootstrap and site
 clusters already show and does only what is missing. Without --resume the
 command refuses to start while a bootstrap cluster exists. A site spec field
 that cannot change once the cluster is built, such as cluster.controlPlaneVIP,
-is compared with the cluster, and a difference stops the run.
+is compared with the cluster, and a difference stops the run. With
+infra.nico.managed this covers NICo too: its install, the machines' ingest, the
+control plane's NICo objects and its move onto the site cluster, which is done
+once the site cluster holds ConfigMap nico-system/nvkectl-handover. A resumed
+run may finish the handover bundle its earlier run started; a new run refuses
+a handover directory that already holds one.
 
 See the bundled examples/sitespec.yaml and docs/sitespec.md for the
 site spec file format.

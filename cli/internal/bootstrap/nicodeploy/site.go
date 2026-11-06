@@ -5,7 +5,6 @@ package nicodeploy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -225,6 +224,38 @@ func (e *Engine) StopNICo(ctx context.Context) error {
 	return nil
 }
 
+// Stopped reports whether StopNICo has stopped NICo: every Deployment and
+// StatefulSet of NICo Core, REST, its site agent and Keycloak asks for no
+// replicas. A cluster without any of them is not stopped.
+func (e *Engine) Stopped(ctx context.Context) (bool, error) {
+	found := false
+	for _, ns := range []string{restNamespace, nicoNamespace} {
+		deployments, err := e.kube.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false, fmt.Errorf("listing Deployments in %s: %w", ns, err)
+		}
+		statefulSets, err := e.kube.AppsV1().StatefulSets(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return false, fmt.Errorf("listing StatefulSets in %s: %w", ns, err)
+		}
+		var replicas []*int32
+		for _, d := range deployments.Items {
+			replicas = append(replicas, d.Spec.Replicas)
+		}
+		for _, s := range statefulSets.Items {
+			replicas = append(replicas, s.Spec.Replicas)
+		}
+		for _, r := range replicas {
+			// An unset count is the API server's default of one.
+			if r == nil || *r != 0 {
+				return false, nil
+			}
+			found = true
+		}
+	}
+	return found, nil
+}
+
 // scaleDeployment sets the Deployment's replicas and returns its pod selector.
 func (e *Engine) scaleDeployment(ctx context.Context, namespace, name string, replicas int) (string, error) {
 	d, err := e.kube.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
@@ -431,22 +462,7 @@ func (e *Engine) RestoreVault(ctx context.Context, kubeconfig, root string, cfg 
 	}
 	e.log.Info("restored NICo's Vault from the snapshot")
 
-	body, err := json.Marshal(keys)
-	if err != nil {
-		return err
-	}
-	stored := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Namespace: vaultNamespace, Name: vaultKeysSecret},
-		Data:       map[string][]byte{vaultKeysKey: body},
-	}
-	// Vault now opens with these keys only, so the write is retried.
-	if err := e.until(ctx, cfg.Timeout, "Vault's keys to be stored", func(ctx context.Context) (bool, error) {
-		err := e.applySecret(ctx, stored)
-		if err != nil {
-			e.log.Warn("storing Vault's keys failed; retrying", "err", err)
-		}
-		return err == nil, nil
-	}); err != nil {
+	if err := e.storeVaultKeys(ctx, keys, cfg.Timeout); err != nil {
 		return err
 	}
 	if err := e.restartVault(ctx, cfg); err != nil {

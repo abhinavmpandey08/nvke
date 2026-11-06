@@ -353,3 +353,42 @@ func TestRunWithoutReadyPod(t *testing.T) {
 	require.ErrorContains(t, err, "no nico-api pod")
 	assert.Empty(t, runner.scripts)
 }
+
+func TestRunSkipsMachinesAlreadyIngested(t *testing.T) {
+	pollInterval = 10 * time.Millisecond
+	tests := []struct {
+		name        string
+		machines    []map[string]any
+		wantScripts bool
+	}{
+		{
+			name:     "every machine Ready or in use",
+			machines: []map[string]any{bmcMachine("aa:bb:cc:dd:ee:01", "InUse"), bmcMachine("aa:bb:cc:dd:ee:02", "Ready")},
+		},
+		{
+			name:        "a machine not discovered yet",
+			machines:    []map[string]any{bmcMachine("aa:bb:cc:dd:ee:01", "Ready")},
+			wantScripts: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kube := fake.NewClientset(readyPod())
+			runner := &fakeKubectl{kube: kube, files: map[string]string{}}
+			calls := 0
+			rest := restServer(t, func() []map[string]any {
+				calls++
+				if calls > 1 {
+					return []map[string]any{bmcMachine("aa:bb:cc:dd:ee:01", "Ready"), bmcMachine("aa:bb:cc:dd:ee:02", "Ready")}
+				}
+				return tt.machines
+			})
+			require.NoError(t, Run(context.Background(), testConfig(t, kube, runner, rest)))
+			if tt.wantScripts {
+				assert.NotEmpty(t, runner.scripts, "the machines are registered")
+			} else {
+				assert.Empty(t, runner.calls, "the admin CLI is not opened")
+			}
+		})
+	}
+}

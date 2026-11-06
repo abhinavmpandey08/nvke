@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -71,11 +69,6 @@ func (s *Settings) validate(p *problems, siteConfigRead bool) {
 	}
 	if s.Site.Replicas < 0 {
 		p.addf("site.replicas must not be negative")
-	}
-	if s.HandoverDir != "" {
-		if _, err := os.Stat(filepath.Join(s.HandoverDir, HandoverVaultKeysFile)); err == nil {
-			p.addf("the handover directory %s already holds a handover bundle: move it away", s.HandoverDir)
-		}
 	}
 	for _, m := range s.DPUFactoryModels {
 		if !dpuFactoryModels[m] {

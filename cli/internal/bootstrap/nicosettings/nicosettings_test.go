@@ -159,8 +159,6 @@ func TestLoad_Refuses(t *testing.T) {
 }
 
 func TestValidate(t *testing.T) {
-	handedOver := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(handedOver, HandoverVaultKeysFile), nil, 0o600))
 	for _, tt := range []struct {
 		name    string
 		mutate  func(s *Settings)
@@ -293,11 +291,6 @@ func TestValidate(t *testing.T) {
 				s.SiteConfig.DHCPNTPServer = "198.51.100.123"
 			},
 			wantErr: "",
-		},
-		{
-			name:    "a handover directory that holds a bundle",
-			mutate:  func(s *Settings) { s.HandoverDir = handedOver },
-			wantErr: "already holds a handover bundle",
 		},
 		{
 			name:    "machine validation without its image",
@@ -704,6 +697,30 @@ func TestSecretsFromEnv(t *testing.T) {
 			assert.Equal(t, rootPassword, got.SiteWideBMCRootPassword)
 			assert.Equal(t, map[string]Login{"NICO_BMC_EXAMPLE": {Username: "root", Password: bmcPassword}}, got.BMCLogins)
 			assert.Equal(t, tt.env[BGPPasswordEnv], got.BGPPassword)
+		})
+	}
+}
+
+func TestRequireNoBundle(t *testing.T) {
+	handedOver := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(handedOver, HandoverVaultKeysFile), nil, 0o600))
+	started := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(started, "vault.snap"), nil, 0o600))
+	for _, tt := range []struct {
+		name, dir, wantErr string
+	}{
+		{name: "no handover directory", dir: ""},
+		{name: "a directory that does not exist", dir: filepath.Join(t.TempDir(), "missing")},
+		{name: "a bundle a move started but did not finish", dir: started},
+		{name: "a directory that holds a bundle", dir: handedOver, wantErr: "already holds a handover bundle"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := RequireNoBundle(tt.dir)
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tt.wantErr)
+			}
 		})
 	}
 }

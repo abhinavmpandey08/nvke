@@ -33,6 +33,7 @@ import (
 	// Aliased: this file has a local variable named engine.
 	bootstrapengine "github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/engine"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/etcdkey"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nvkrrelease"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/pivot"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitecluster"
@@ -198,7 +199,12 @@ working directory, plus --resume. Each step checks what the bootstrap and site
 clusters already show and does only what is missing. Without --resume the
 command refuses to start while a bootstrap cluster exists. A site spec field
 that cannot change once the cluster is built, such as cluster.controlPlaneVIP,
-is compared with the cluster, and a difference stops the run.
+is compared with the cluster, and a difference stops the run. With
+infra.nico.managed this covers NICo too: its install, the machines' ingest, the
+control plane's NICo objects and its move onto the site cluster, which is done
+once the site cluster holds ConfigMap nico-system/nvkectl-handover. A resumed
+run may finish the handover bundle its earlier run started; a new run refuses
+a handover directory that already holds one.
 
 See the bundled examples/sitespec.yaml and docs/sitespec.md for the
 site spec file format.`,
@@ -381,6 +387,14 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 		return err
 	}
 
+	// A resumed run may continue the bundle its own earlier run started; that
+	// is known only once it has found the bootstrap cluster, below.
+	if nico != nil && !opts.resume {
+		if err := nicosettings.RequireNoBundle(nico.settings.HandoverDir); err != nil {
+			return fmt.Errorf("site spec file %s: %w", opts.siteSpec, err)
+		}
+	}
+
 	if opts.dryRun {
 		fmt.Fprintln(out, "\nDry run: site spec is valid. No workflow dispatched.")
 		return nil
@@ -437,6 +451,11 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 		}
 		if !adopt {
 			logger.Info("no bootstrap cluster to resume; starting a new bootstrap", "bootstrap_kind_cluster", cfg.ClusterName)
+			if nico != nil {
+				if err := nicosettings.RequireNoBundle(nico.settings.HandoverDir); err != nil {
+					return fmt.Errorf("site spec file %s: %w", opts.siteSpec, err)
+				}
+			}
 		}
 	}
 
@@ -522,6 +541,11 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	// management plane, so like one past site-cluster creation it is kept on
 	// any failure.
 	siteClusterCreated := adopt
+	// nicoInstalling is set once the bootstrap starts installing NICo, which
+	// goes on to change the site's machines: their BMC passwords and DPUs. A
+	// failure from then on keeps the bootstrap cluster, whose NICo is the only
+	// one that knows them, so --resume can continue.
+	nicoInstalling := false
 	// handedOver is set once the site cluster and every artifact the operator
 	// needs are on disk. A failure after that is about the site cluster, so
 	// without -v the bootstrap cluster's diagnostics are not collected and it
@@ -556,12 +580,16 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 			cancelDiagnostics()
 		}
 
-		// Once the site cluster exists, any failure keeps the bootstrap cluster for recovery.
-		if opts.keepBootstrapKind || (siteClusterCreated && err != nil) {
-			if siteClusterCreated && err != nil {
+		// Once NICo installs or the site cluster exists, any failure keeps the bootstrap cluster for recovery.
+		if opts.keepBootstrapKind || ((siteClusterCreated || nicoInstalling) && err != nil) {
+			switch {
+			case siteClusterCreated && err != nil:
 				logger.Warn("bootstrap failed after site cluster creation; retaining the bootstrap kind cluster for recovery",
 					"bootstrap_kind_cluster", cluster.Name, "kubeconfig", cluster.KubeconfigPath)
-			} else {
+			case nicoInstalling && err != nil:
+				logger.Warn("bootstrap failed after NICo's install started; retaining the bootstrap kind cluster: "+
+					"continue with --resume", "bootstrap_kind_cluster", cluster.Name, "kubeconfig", cluster.KubeconfigPath)
+			default:
 				logger.Info("--keep-bootstrap-cluster set: leaving the bootstrap kind cluster running",
 					"bootstrap_kind_cluster", cluster.Name, "kubeconfig", cluster.KubeconfigPath)
 			}
@@ -572,6 +600,12 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 			context.WithoutCancel(ctx), cleanupTimeout,
 		)
 		defer cancelDelete()
+		// Nothing is left behind the addresses the bootstrap host announces.
+		if nico != nil {
+			if releaseErr := nico.release(deleteCtx, engine.Runner, logger); releaseErr != nil {
+				logger.Error("failed to withdraw NICo's service addresses from the bootstrap host", "err", releaseErr)
+			}
+		}
 		if deleteErr := engine.Delete(deleteCtx, cluster.Name); deleteErr != nil {
 			logger.Error("failed to tear down bootstrap kind cluster",
 				"bootstrap_kind_cluster", cluster.Name, "err", deleteErr)
@@ -586,13 +620,6 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 		}
 	}()
 
-	// The site's routers reach NICo's addresses on this host over BGP.
-	if nico != nil {
-		if err := nico.announce(ctx, adopt, cluster.Name, cluster.KubeconfigPath, engine.Runner, logger); err != nil {
-			return fmt.Errorf("announcing NICo's service addresses from the bootstrap host: %w", err)
-		}
-	}
-
 	kubeconfigPath := siteKubeconfigPath(inv.ClusterName, opts)
 	cweURL := fmt.Sprintf("http://127.0.0.1:%d", cweCfg.CWEPort)
 	controller, err := clients.New(config.SiteConfig{URL: cweURL})
@@ -601,25 +628,56 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	}
 
 	// Once the pivot has started, the stack installs before it would undo what
-	// it did, and the bootstrap cluster's controller may be stopped.
+	// it did, and the bootstrap cluster's controller may be stopped. Once the
+	// site cluster is requested, the installed NICo is what it is built from.
+	// requestUnknown is set when the controller does not answer yet.
+	started, siteRequested, requestUnknown := false, false, false
 	if adopt {
-		started, err := pivotStarted(ctx, controllerdeploy.New(opts.cweRunner, logger), cluster.KubeconfigPath, kubeconfigPath, logger)
-		if err != nil {
+		cwe := controllerdeploy.New(opts.cweRunner, logger)
+		if started, err = pivotStarted(ctx, cwe, cluster.KubeconfigPath, kubeconfigPath, logger); err != nil {
 			return err
 		}
-		if started {
-			handedOver = true
-			ctx = phases.enter(phaseFinish, nil)
-			if err := requireSiteVIP(kubeconfigPath, inv.Cluster.ControlPlaneVIP); err != nil {
+		siteRequested = started
+		if !started && nico != nil {
+			siteRequested, requestUnknown, err = siteClusterRequested(ctx, cwe, cluster.KubeconfigPath, cweURL, cweCfg.ReadyTimeout, controller, inv)
+			if err != nil {
 				return err
 			}
-			logger.Info("the pivot to the site cluster has started; continuing it")
-			if err := pivotToSite(ctx, inv, cluster.KubeconfigPath, kubeconfigPath, cweCfg, controller, uuid.Nil, logger); err != nil {
-				return pivotFailedError(err, cluster)
+			if requestUnknown {
+				logger.Warn("the bootstrap cluster's controller does not answer, so whether it holds the site cluster is not known " +
+					"until the NVKE stack is up; until then the control-plane VIP stays off the bootstrap host")
 			}
-			fmt.Fprintf(out, "\nCluster %q is ready. Talk to it with:\n  kubectl --kubeconfig %s get nodes\n", inv.ClusterName, kubeconfigPath)
-			return nil
 		}
+	}
+
+	// The site's routers reach NICo's addresses on this host over BGP.
+	if nico != nil {
+		if err := nico.announce(ctx, adopt, siteRequested, requestUnknown, cluster.Name, cluster.KubeconfigPath, engine.Runner, logger); err != nil {
+			return fmt.Errorf("announcing NICo's service addresses from the bootstrap host: %w", err)
+		}
+	}
+
+	if started {
+		handedOver = true
+		ctx = phases.enter(phaseFinish, nil)
+		if err := requireSiteVIP(kubeconfigPath, inv.Cluster.ControlPlaneVIP); err != nil {
+			return err
+		}
+		logger.Info("the pivot to the site cluster has started; continuing it")
+		if err := pivotToSite(ctx, inv, cluster.KubeconfigPath, kubeconfigPath, cweCfg, controller, uuid.Nil, logger); err != nil {
+			return pivotFailedError(err, cluster)
+		}
+		if nico != nil {
+			defer nico.removeSource()
+			if err := nico.install(ctx, cluster.KubeconfigPath, &cweCfg, true, opts.cweRunner, logger); err != nil {
+				return nicoMoveFailedError(err, cluster)
+			}
+			if err := moveNico(ctx, out, nico, adopt, inv, cluster, kubeconfigPath, opts, engine, logger); err != nil {
+				return err
+			}
+		}
+		fmt.Fprintf(out, "\nCluster %q is ready. Talk to it with:\n  kubectl --kubeconfig %s get nodes\n", inv.ClusterName, kubeconfigPath)
+		return nil
 	}
 
 	// A NICo the bootstrap installs runs in the bootstrap cluster until the site
@@ -627,7 +685,10 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	// first, and the stack's CAPNICo is given its credentials.
 	if nico != nil {
 		defer nico.removeSource()
-		if err := nico.install(ctx, cluster.KubeconfigPath, &cweCfg, opts.cweRunner, logger); err != nil {
+		nicoInstalling = true
+		// A controller that does not answer yet was installed after NICo, so an
+		// unknown request is read back like an accepted one.
+		if err := nico.install(ctx, cluster.KubeconfigPath, &cweCfg, siteRequested || requestUnknown, opts.cweRunner, logger); err != nil {
 			return fmt.Errorf("setting up NICo in the bootstrap cluster: %w", err)
 		}
 	}
@@ -642,7 +703,17 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	// After the stack, so a stack that fails to install has not cost hours of
 	// ingest and left the machines changed by a NICo about to be deleted.
 	if nico != nil {
-		if err := nico.configure(ctx, inv, cluster.KubeconfigPath, opts.cweRunner, logger); err != nil {
+		if requestUnknown {
+			found, err := sitecluster.Find(ctx, controller, inv)
+			if err != nil {
+				return err
+			}
+			siteRequested = found != nil
+			if err := nico.settleVIP(ctx, siteRequested, engine.Runner, logger); err != nil {
+				return fmt.Errorf("announcing NICo's service addresses from the bootstrap host: %w", err)
+			}
+		}
+		if err := nico.configure(ctx, inv, cluster.KubeconfigPath, siteRequested, opts.cweRunner, logger); err != nil {
 			return fmt.Errorf("configuring NICo for the site cluster: %w", err)
 		}
 	}
@@ -702,17 +773,61 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	}
 	// Before the bootstrap cluster goes, NICo moves off it onto the site cluster.
 	if nico != nil {
-		if err := nico.move(ctx, cluster.KubeconfigPath, kubeconfigPath, opts.cweRunner, engine.Runner, logger); err != nil {
-			return nicoMoveFailedError(err, cluster)
+		if err := moveNico(ctx, out, nico, adopt, inv, cluster, kubeconfigPath, opts, engine, logger); err != nil {
+			return err
 		}
-		fmt.Fprintf(out, "\nNICo runs on cluster %q. Its handover bundle, with NICo's Vault keys, is in %s: move it off this host.\n",
-			inv.ClusterName, nico.settings.HandoverDir)
 	}
 
 	// Nico mode does not list the allocated nodes here; kubectl get nodes shows them.
 	fmt.Fprintf(out, "\nCluster %q is ready. Talk to it with:\n  kubectl --kubeconfig %s get nodes\n",
 		inv.ClusterName, kubeconfigPath)
 	return nil
+}
+
+// moveNico moves NICo off the bootstrap cluster onto the site cluster, whose
+// kubeconfig is at kubeconfigPath, and says where its handover bundle is. With
+// resume, it continues a move an earlier run of this bootstrap started.
+func moveNico(
+	ctx context.Context,
+	out io.Writer,
+	nico *managedNico,
+	resume bool,
+	inv *sitespec.SiteSpec,
+	cluster *bootstrapengine.Cluster,
+	kubeconfigPath string,
+	opts *bootstrapSiteOptions,
+	engine *bootstrapengine.Engine,
+	logger *slog.Logger,
+) error {
+	if err := nico.move(ctx, resume, cluster.KubeconfigPath, kubeconfigPath, opts.cweRunner, engine.Runner, logger); err != nil {
+		return nicoMoveFailedError(err, cluster)
+	}
+	fmt.Fprintf(out, "\nNICo runs on cluster %q. Its handover bundle, with NICo's Vault keys, is in %s: move it off this host.\n",
+		inv.ClusterName, nico.settings.HandoverDir)
+	return nil
+}
+
+// siteClusterRequested reports whether the bootstrap cluster's controller, at
+// cweURL, holds the site cluster: whether an earlier run's create request was
+// accepted. Without a controller installed no request was made. unknown is
+// set when the controller is installed but does not answer within timeout.
+func siteClusterRequested(
+	ctx context.Context,
+	cwe *controllerdeploy.Engine,
+	seedKubeconfig, cweURL string,
+	timeout time.Duration,
+	controller sitecluster.ClusterAPI,
+	inv *sitespec.SiteSpec,
+) (requested, unknown bool, err error) {
+	replicas, err := cwe.ControllerReplicas(ctx, seedKubeconfig)
+	if err != nil || replicas == "" {
+		return false, false, err
+	}
+	if err := waitForCWEHostEndpoint(ctx, cweURL, timeout); err != nil {
+		return false, true, nil
+	}
+	found, err := sitecluster.Find(ctx, controller, inv)
+	return found != nil, false, err
 }
 
 // siteDeployAttempts bounds how often deploySiteStack runs the install.

@@ -6,13 +6,18 @@ package nvkectl
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/controllerdeploy"
@@ -186,4 +191,53 @@ func TestRunBootstrapSiteResume(t *testing.T) {
 		})
 		require.ErrorContains(t, err, "built with control-plane VIP 10.0.0.200, but the site spec says 10.0.0.100")
 	})
+}
+
+// replicasRunner answers the controller's replicas with replicas.
+type replicasRunner struct{ replicas string }
+
+func (r replicasRunner) Run(context.Context, string, ...string) (string, error) {
+	return r.replicas, nil
+}
+
+// listingAPI is a controller that lists listed.
+type listingAPI struct {
+	sitecluster.ClusterAPI
+	listed []api.Cluster
+}
+
+func (l listingAPI) ListClusters(context.Context, *api.ListClustersParams) ([]api.Cluster, error) {
+	return l.listed, nil
+}
+
+// TestSiteClusterRequested: a resumed run asks the bootstrap cluster's
+// controller whether the site cluster was requested; with no controller
+// installed it was not, and a controller that does not answer leaves it unknown.
+func TestSiteClusterRequested(t *testing.T) {
+	inv, err := sitespec.Load(nicoSiteSpecFile(t))
+	require.NoError(t, err)
+	ready := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(ready.Close)
+	silent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+	t.Cleanup(silent.Close)
+	for name, tt := range map[string]struct {
+		replicas, url string
+		listed        []api.Cluster
+		wantRequested bool
+		wantUnknown   bool
+	}{
+		"no controller installed":        {replicas: "", url: silent.URL},
+		"the controller holds the site":  {replicas: "1", url: ready.URL, listed: []api.Cluster{{Name: inv.ClusterName}}, wantRequested: true},
+		"the controller holds no site":   {replicas: "1", url: ready.URL, listed: []api.Cluster{{Name: "another-site"}}},
+		"the controller does not answer": {replicas: "1", url: silent.URL, wantUnknown: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cwe := controllerdeploy.New(replicasRunner{tt.replicas}, slog.New(slog.DiscardHandler))
+			requested, unknown, err := siteClusterRequested(context.Background(), cwe, "/seed", tt.url, 50*time.Millisecond,
+				listingAPI{listed: tt.listed}, inv)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantRequested, requested)
+			assert.Equal(t, tt.wantUnknown, unknown)
+		})
+	}
 }

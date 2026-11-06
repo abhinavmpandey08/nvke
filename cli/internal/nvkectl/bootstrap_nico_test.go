@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -232,6 +233,29 @@ func TestRunBootstrapSiteDryRunLoadsManagedNico(t *testing.T) {
 		err := runBootstrapSite(context.Background(), io.Discard, &bootstrapSiteOptions{siteSpec: path, dryRun: true})
 		require.ErrorContains(t, err, nicosettings.HostUEFIPasswordEnv)
 	})
+	// A resumed run may continue its own bundle, which it can tell only once it
+	// finds its bootstrap cluster; a new run refuses one.
+	for name, tt := range map[string]struct {
+		resume  bool
+		wantErr string
+	}{
+		"a handover bundle an earlier bootstrap left":                  {wantErr: "already holds a handover bundle"},
+		"a handover bundle with --resume, checked against the cluster": {resume: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := managedNicoSiteSpec(t, 1)
+			inv, err := sitespec.Load(path)
+			require.NoError(t, err)
+			require.NoError(t, os.MkdirAll(inv.NicoHandoverDir(), 0o700))
+			require.NoError(t, os.WriteFile(filepath.Join(inv.NicoHandoverDir(), nicosettings.HandoverVaultKeysFile), nil, 0o600))
+			err = runBootstrapSite(context.Background(), io.Discard, &bootstrapSiteOptions{siteSpec: path, dryRun: true, resume: tt.resume})
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
 }
 
 // TestManagedNicoAddresses: the addresses put on the bootstrap host are those
@@ -305,15 +329,18 @@ func recordedWithdrawn(t *testing.T, n *managedNico) []string {
 
 // TestManagedNicoAnnounce: a new run announces every service address; a
 // resumed run announces only those an earlier run did not withdraw, takes the
-// withdrawn ones off the host and puts the others back.
+// withdrawn ones off the host and puts the others back. The VIP of a site
+// cluster already requested counts as withdrawn; while that is unknown, it is
+// held off the host without being recorded.
 func TestManagedNicoAnnounce(t *testing.T) {
 	const onLo = "1: lo    inet 192.0.2.250/32 scope global lo\n"
 	for name, tt := range map[string]struct {
-		adopted   bool
-		withdrawn []string
-		wantConf  []string
-		notConf   []string
-		wantCalls []string
+		adopted, siteRequested, requestUnknown bool
+		withdrawn                              []string
+		wantConf                               []string
+		notConf                                []string
+		wantCalls                              []string
+		wantRecorded                           []string
 	}{
 		"a new run": {
 			wantConf:  []string{"network 192.0.2.10/32", "network 192.0.2.250/32", "bgp router-id 10.0.0.5"},
@@ -324,15 +351,27 @@ func TestManagedNicoAnnounce(t *testing.T) {
 			wantConf: []string{"network 192.0.2.10/32"}, notConf: []string{"192.0.2.250"},
 			wantCalls: []string{"ip addr del 192.0.2.250/32 dev lo", "ip addr add 192.0.2.10/32 dev lo", "nerdctl rm -f nvkectl-bootstrap-nico-bgp", "nerdctl run"},
 		},
-		"resumed after every address was withdrawn": {
+		"resumed after every address was withdrawn, before the speaker stopped": {
 			adopted: true, withdrawn: []string{"192.0.2.10", "192.0.2.11", "192.0.2.12", "192.0.2.250"},
-			wantCalls: []string{"ip addr del 192.0.2.250/32 dev lo"},
+			wantCalls: []string{"ip addr del 192.0.2.250/32 dev lo", "nerdctl rm -f nvkectl-bootstrap-nico-bgp"},
+		},
+		"resumed after the site was requested, before the VIP was recorded withdrawn": {
+			adopted: true, siteRequested: true,
+			wantConf: []string{"network 192.0.2.10/32"}, notConf: []string{"192.0.2.250"},
+			wantCalls:    []string{"ip addr del 192.0.2.250/32 dev lo", "ip addr add 192.0.2.10/32 dev lo", "nerdctl rm -f nvkectl-bootstrap-nico-bgp", "nerdctl run"},
+			wantRecorded: []string{"192.0.2.250"},
+		},
+		"resumed before it is known whether the site was requested": {
+			adopted: true, requestUnknown: true,
+			wantConf: []string{"network 192.0.2.10/32"}, notConf: []string{"192.0.2.250"},
+			wantCalls: []string{"ip addr del 192.0.2.250/32 dev lo", "ip addr add 192.0.2.10/32 dev lo", "nerdctl rm -f nvkectl-bootstrap-nico-bgp", "nerdctl run"},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			n := vipNico(t, "192.0.2.250:30388", "192.0.2.250:30082", tt.withdrawn...)
 			host := &seedHost{addrs: onLo}
-			require.NoError(t, n.announce(context.Background(), tt.adopted, "nvkectl-bootstrap", "", host, slog.New(slog.DiscardHandler)))
+			require.NoError(t, n.announce(context.Background(), tt.adopted, tt.siteRequested, tt.requestUnknown, "nvkectl-bootstrap", "", host,
+				slog.New(slog.DiscardHandler)))
 			var got []string
 			for _, c := range host.calls {
 				if strings.HasPrefix(c, "nerdctl run") {
@@ -351,6 +390,48 @@ func TestManagedNicoAnnounce(t *testing.T) {
 			}
 			for _, w := range tt.notConf {
 				assert.NotContains(t, string(conf), w)
+			}
+			_, err := n.seedKube.CoreV1().ConfigMaps(withdrawnNamespace).Get(context.Background(), withdrawnConfigMap, metav1.GetOptions{})
+			if tt.wantRecorded == nil && tt.withdrawn == nil {
+				assert.Error(t, err, "nothing is recorded withdrawn")
+			} else if tt.wantRecorded != nil {
+				assert.Equal(t, tt.wantRecorded, recordedWithdrawn(t, n))
+			}
+		})
+	}
+}
+
+// TestManagedNicoSettleVIP: a VIP held off the host while the site request
+// was unknown is recorded withdrawn once the controller shows the site cluster,
+// and goes back on lo and into the speaker once it shows none. Without a hold
+// nothing changes.
+func TestManagedNicoSettleVIP(t *testing.T) {
+	for name, tt := range map[string]struct {
+		held, requested bool
+		wantAdd         bool
+		wantConf        bool
+		wantRecorded    bool
+	}{
+		"held, and the site was requested":     {held: true, requested: true, wantRecorded: true},
+		"held, and no site was requested":      {held: true, wantAdd: true, wantConf: true},
+		"not held":                             {wantConf: true},
+		"not held, and the site was requested": {requested: true, wantConf: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			n := vipNico(t, "192.0.2.250:30388", "192.0.2.250:30082")
+			host := &seedHost{}
+			require.NoError(t, n.announce(context.Background(), true, false, tt.held, "nvkectl-bootstrap", "", host, slog.New(slog.DiscardHandler)))
+			host.calls = nil
+			require.NoError(t, n.settleVIP(context.Background(), tt.requested, host, slog.New(slog.DiscardHandler)))
+			assert.False(t, n.vipHeld)
+			conf, err := os.ReadFile(filepath.Join(n.bgpDir, "frr.conf"))
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantConf, strings.Contains(string(conf), "network 192.0.2.250/32"))
+			assert.Equal(t, tt.wantAdd, slices.Contains(host.calls, "ip addr add 192.0.2.250/32 dev lo"))
+			if tt.wantRecorded {
+				assert.Equal(t, []string{"192.0.2.250"}, recordedWithdrawn(t, n))
+			} else {
+				assert.NotContains(t, n.withdrawn, "192.0.2.250")
 			}
 		})
 	}
@@ -423,6 +504,45 @@ func TestManagedNicoWithdrawAll(t *testing.T) {
 	require.NoError(t, n.withdrawAll(context.Background(), host, slog.New(slog.DiscardHandler)))
 	assert.Equal(t, []string{"nerdctl rm -f nvkectl-bootstrap-nico-bgp", "ip addr del 192.0.2.10/32 dev lo"}, host.calls)
 	assert.ElementsMatch(t, n.addresses(), recordedWithdrawn(t, n))
+}
+
+// TestManagedNicoCapnicoInCluster: CAPNICo uses NICo's in-cluster endpoints
+// once the VIP REST or Keycloak shares is withdrawn or held off the host.
+func TestManagedNicoCapnicoInCluster(t *testing.T) {
+	for name, tt := range map[string]struct {
+		rest      string
+		withdrawn []string
+		held      bool
+		want      bool
+	}{
+		"on the VIP, still announced":  {rest: "192.0.2.250:30388"},
+		"on the VIP, withdrawn":        {rest: "192.0.2.250:30388", withdrawn: []string{"192.0.2.250"}, want: true},
+		"on the VIP, held off":         {rest: "192.0.2.250:30388", held: true, want: true},
+		"off the VIP, all withdrawn":   {rest: "192.0.2.13", withdrawn: []string{"192.0.2.13", "192.0.2.250"}},
+		"off the VIP, nothing changed": {rest: "192.0.2.13"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			n := vipNico(t, tt.rest, "192.0.2.14")
+			n.withdrawn, n.vipHeld = tt.withdrawn, tt.held
+			assert.Equal(t, tt.want, n.capnicoInCluster())
+		})
+	}
+}
+
+// TestManagedNicoRelease: deleting the bootstrap cluster stops the speaker and
+// takes the addresses off the host, without recording them withdrawn.
+func TestManagedNicoRelease(t *testing.T) {
+	n := vipNico(t, "192.0.2.13", "192.0.2.14")
+	host := &seedHost{addrs: "1: lo    inet 192.0.2.10/32 scope global lo\n"}
+	n.speaker = &seedbgp.Speaker{Runner: host, Logger: slog.New(slog.DiscardHandler)}
+	n.bgp = seedbgp.Config{Name: "nvkectl-bootstrap-nico-bgp", Dir: n.bgpDir}
+	require.NoError(t, n.release(context.Background(), host, slog.New(slog.DiscardHandler)))
+	assert.Equal(t, []string{"nerdctl rm -f nvkectl-bootstrap-nico-bgp", "ip addr del 192.0.2.10/32 dev lo"}, host.calls)
+
+	host.calls = nil
+	n.speaker = nil
+	require.NoError(t, n.release(context.Background(), host, slog.New(slog.DiscardHandler)), "a speaker never started")
+	assert.Equal(t, []string{"ip addr del 192.0.2.10/32 dev lo"}, host.calls)
 }
 
 // acceptingAPI is a controller that accepts every create request.

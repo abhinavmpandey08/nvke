@@ -351,3 +351,87 @@ func TestDumpAndRestoreDatabase(t *testing.T) {
 
 	assert.Error(t, e.DumpDatabase(ctx, "seed", "nico_rest; drop", path))
 }
+
+func TestStopped(t *testing.T) {
+	zero, two := int32(0), int32(2)
+	deployment := func(ns, name string, replicas *int32) runtime.Object {
+		return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}, Spec: appsv1.DeploymentSpec{Replicas: replicas}}
+	}
+	statefulSet := func(ns, name string, replicas *int32) runtime.Object {
+		return &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}, Spec: appsv1.StatefulSetSpec{Replicas: replicas}}
+	}
+	tests := []struct {
+		name    string
+		objects []runtime.Object
+		want    bool
+	}{
+		{name: "nothing installed", want: false},
+		{
+			name:    "running",
+			objects: []runtime.Object{deployment(restNamespace, "nico-rest-api", &two), deployment(nicoNamespace, "nico-api", &two)},
+			want:    false,
+		},
+		{
+			name:    "only REST's API stopped, as the move's first step leaves it",
+			objects: []runtime.Object{deployment(restNamespace, "nico-rest-api", &zero), deployment(nicoNamespace, "nico-api", &two)},
+			want:    false,
+		},
+		{
+			name:    "a replica count left unset runs one",
+			objects: []runtime.Object{deployment(restNamespace, "nico-rest-api", &zero), statefulSet(restNamespace, siteAgentRelease, nil)},
+			want:    false,
+		},
+		{
+			name: "every workload stopped; Temporal keeps running",
+			objects: []runtime.Object{
+				deployment(restNamespace, "nico-rest-api", &zero), deployment(nicoNamespace, "nico-api", &zero),
+				statefulSet(restNamespace, siteAgentRelease, &zero), deployment(temporalNamespace, "temporal-frontend", &two),
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := New(nil, fake.NewClientset(tt.objects...), discardLog()).Stopped(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestInstalled(t *testing.T) {
+	const site = "6f1c2a52-3c0e-4b4e-9b4f-0d3c9b8d6a11"
+	agent := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: restNamespace, Name: siteAgentConfigMap}, Data: map[string]string{"CLUSTER_ID": site}}
+	login := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: restNamespace, Name: keycloakLoginSecret},
+		Data:       map[string][]byte{"admin-password": []byte("example-admin"), "ncx-service-secret": []byte("example-secret")},
+	}
+	tests := []struct {
+		name    string
+		objects []runtime.Object
+		wantErr string
+	}{
+		{name: "an installed NICo is read back", objects: []runtime.Object{agent, login}},
+		{name: "no registered site", objects: []runtime.Object{login}, wantErr: "no registered site"},
+		{name: "no Keycloak login", objects: []runtime.Object{agent}, wantErr: keycloakLoginSecret},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kube := fake.NewClientset(tt.objects...)
+			cfg := restTestConfig()
+			inst, err := New(nil, kube, discardLog()).Installed(context.Background(), cfg)
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, site, inst.SiteID)
+			assert.Equal(t, "http://10.0.0.88:8388", inst.RESTEndpoint)
+			assert.Equal(t, "example-secret", inst.Credentials.ClientSecret)
+			assert.Equal(t, serviceClientID, inst.Credentials.ClientID)
+			for _, a := range kube.Actions() {
+				assert.Equal(t, "get", a.GetVerb(), "reading the installed NICo writes nothing")
+			}
+		})
+	}
+}
