@@ -33,7 +33,6 @@ import (
 	// Aliased: this file has a local variable named engine.
 	bootstrapengine "github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/engine"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/etcdkey"
-	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicodeploy"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nvkrrelease"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/pivot"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitecluster"
@@ -421,7 +420,7 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	cfg.ExtraPortMappings = append(cfg.ExtraPortMappings, bootstrapPortMappings(cweCfg)...)
 	// A NICo the bootstrap installs is published on its service addresses on this host.
 	if nico != nil {
-		cfg.ExtraPortMappings = append(cfg.ExtraPortMappings, nicodeploy.SeedPortMappings(nico.settings.Addresses)...)
+		cfg.ExtraPortMappings = append(cfg.ExtraPortMappings, nico.portMappings()...)
 	}
 
 	engine := bootstrapengine.New(opts.bootstrapRunner, logger)
@@ -497,9 +496,10 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	}
 
 	ctx = phases.enter(phaseBootstrapCluster, nil)
-	// Kind binds each NICo port mapping to its address, which must exist first,
-	// and a resumed run's host may have lost it.
-	if nico != nil {
+	// Kind binds each NICo port mapping to its address, which must exist first.
+	// A resumed run puts back those its host lost once it has read which an
+	// earlier run withdrew.
+	if nico != nil && !adopt {
 		if err := ensureHostAddresses(ctx, engine.Runner, nico.addresses(), logger); err != nil {
 			return err
 		}
@@ -586,6 +586,13 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 		}
 	}()
 
+	// The site's routers reach NICo's addresses on this host over BGP.
+	if nico != nil {
+		if err := nico.announce(ctx, adopt, cluster.Name, cluster.KubeconfigPath, engine.Runner, logger); err != nil {
+			return fmt.Errorf("announcing NICo's service addresses from the bootstrap host: %w", err)
+		}
+	}
+
 	kubeconfigPath := siteKubeconfigPath(inv.ClusterName, opts)
 	cweURL := fmt.Sprintf("http://127.0.0.1:%d", cweCfg.CWEPort)
 	controller, err := clients.New(config.SiteConfig{URL: cweURL})
@@ -645,7 +652,15 @@ func runBootstrapSite(ctx context.Context, out io.Writer, opts *bootstrapSiteOpt
 	// objects that the provisioned infrastructure provider binds to the
 	// site spec's hosts.
 	ctx = phases.enter(phaseSiteCluster, nil)
-	siteClusterID, created, err := createSiteCluster(ctx, cluster, inv, opts, controller, logger)
+	// Once the request is accepted, the site's kube-vip may soon announce the
+	// control-plane VIP, so the bootstrap host stops holding it.
+	var accepted func(context.Context) error
+	if nico != nil {
+		accepted = func(ctx context.Context) error {
+			return nico.withdrawVIP(ctx, cluster.KubeconfigPath, opts.cweRunner, engine.Runner, logger)
+		}
+	}
+	siteClusterID, created, err := createSiteCluster(ctx, cluster, inv, opts, controller, accepted, logger)
 	siteClusterCreated = siteClusterCreated || created
 	if err != nil && created {
 		return retainedClusterError(err, inv, cluster, cweCfg.CWEPort)
@@ -886,9 +901,11 @@ func dumpSpireBootstrapEntries(
 	return dumper.Dump(ctx, outputDir)
 }
 
-// createSiteCluster posts the cluster to the controller through client, waits
-// for it to come up, and writes out its kubeconfig and etcd encryption key. It
-// returns the cluster's ID once the controller has created it. The boolean
+// createSiteCluster posts the cluster to the controller through client, calls
+// accepted when it is not nil once the controller has accepted the request (or
+// a resumed run found the cluster), waits for it to come up, and writes out
+// its kubeconfig and etcd encryption key. It returns the cluster's ID once the
+// controller has created it. The boolean
 // reports whether the controller accepted the create request, after which
 // callers must preserve the management cluster on failure so the in-progress
 // site cluster remains recoverable.
@@ -898,6 +915,7 @@ func createSiteCluster(
 	inv *sitespec.SiteSpec,
 	opts *bootstrapSiteOptions,
 	client sitecluster.ClusterAPI,
+	accepted func(context.Context) error,
 	logger *slog.Logger,
 ) (uuid.UUID, bool, error) {
 	var created *api.Cluster
@@ -921,6 +939,11 @@ func createSiteCluster(
 			// allocating NICo instances, which deleting the bootstrap cluster would
 			// leave unmanaged; it is kept as after any failure past the create.
 			return uuid.Nil, inv.IsNico() && errors.Is(err, sitecluster.ErrCreateUnconfirmed), err
+		}
+	}
+	if accepted != nil {
+		if err := accepted(ctx); err != nil {
+			return created.ID, true, err
 		}
 	}
 

@@ -276,7 +276,7 @@ func startFake(t *testing.T, f *fakeNICo) *nicorest.Client {
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	return nicorest.New(srv.URL, "ncx", nicorest.DefaultAPIName,
-		nicorest.ClientCredentials{TokenURL: srv.URL + "/token", ClientID: "ncx-service", ClientSecret: "example-secret"})
+		nicorest.ClientCredentials{TokenURL: srv.URL + "/token", ClientID: "ncx-service", ClientSecret: "example-secret"}, nil)
 }
 
 func testConfig(rest *nicorest.Client, vpcType string, serials ...string) Config {

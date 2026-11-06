@@ -4,6 +4,8 @@
 package nicodeploy
 
 import (
+	"context"
+	"net"
 	"time"
 
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicorest"
@@ -54,6 +56,8 @@ type Config struct {
 	Secrets nicosettings.Secrets
 	// Profile is the cluster NICo is installed on.
 	Profile Profile
+	// Dial connects nvkectl's REST client; a plain dialer when nil. See SeedLoopback.
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	// siteRootCarried is set when the site root CA was copied from the
 	// bootstrap cluster, so the prerequisites use it instead of issuing one.
 	siteRootCarried bool
@@ -94,9 +98,11 @@ type Installed struct {
 	APIName string
 	// Credentials are the OAuth2 client nvkectl and CAPNICo fetch tokens with.
 	Credentials nicorest.ClientCredentials
+	// Dial connects REST's client; a plain dialer when nil.
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // REST returns a client of the installed NICo's REST API.
 func (i *Installed) REST() *nicorest.Client {
-	return nicorest.New(i.RESTEndpoint, i.OrgID, i.APIName, i.Credentials)
+	return nicorest.New(i.RESTEndpoint, i.OrgID, i.APIName, i.Credentials, i.Dial)
 }

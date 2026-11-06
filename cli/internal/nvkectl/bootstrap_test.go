@@ -1972,7 +1972,7 @@ func TestCreateSiteCluster_KeepsKindAfterAnUnconfirmedNicoCreate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, kept, err := createSiteCluster(context.Background(), nil, tt.inv, &bootstrapSiteOptions{}, client, slog.New(slog.DiscardHandler))
+			_, kept, err := createSiteCluster(context.Background(), nil, tt.inv, &bootstrapSiteOptions{}, client, nil, slog.New(slog.DiscardHandler))
 			if err == nil {
 				t.Fatal("expected createSiteCluster to fail")
 			}

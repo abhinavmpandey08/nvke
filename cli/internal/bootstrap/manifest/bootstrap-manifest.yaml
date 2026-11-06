@@ -135,6 +135,16 @@ components:
       url: https://github.com/NVIDIA/infra-controller/archive/refs/tags/v2.2.2.tar.gz
       sha256: bc966ae60121f5cdf91647e28713f2d3f844cebd6f7891ce5ae8616b2a395ee5
 
+  # Run only with infra.nico.managed, on the bootstrap host: the BGP speaker
+  # that announces NICo's service addresses until NICo moves to the site
+  # cluster. An upstream release, run by the digest below, the
+  # multi-architecture index's.
+  frr:
+    images:
+      speaker:
+        ref: quay.io/frrouting/frr:10.7.1
+        digest: sha256:e995beaa50fdc9edb35eadcfefa29b7f062cc06f2b812613789b68fa541554d2
+
   # Upstream releases, at the versions NICo v2.2.2's helmfile pins. Installed
   # only with infra.nico.managed.
   postgres-operator:

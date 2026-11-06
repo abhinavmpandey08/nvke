@@ -115,6 +115,7 @@ func (e *Engine) Install(ctx context.Context, kubeconfig, root string, cfg Confi
 		OrgID:        cfg.Settings.EffectiveOrgID(),
 		APIName:      nicorest.DefaultAPIName,
 		Credentials:  creds,
+		Dial:         cfg.Dial,
 	}
 	if err := e.verify(ctx, cfg, inst); err != nil {
 		return nil, err
@@ -197,6 +198,12 @@ func restOverrides(cfg Config, dbUser, dbPassword string, login *keycloakLogin) 
 		},
 	}
 }
+
+// InClusterRESTEndpoint is NICo REST's base URL inside the cluster NICo runs on.
+const InClusterRESTEndpoint = "http://nico-rest-api." + restNamespace + ".svc:8388"
+
+// InClusterTokenURL is the bundled Keycloak's token endpoint inside the cluster NICo runs on.
+const InClusterTokenURL = "http://keycloak." + restNamespace + ".svc:8082/realms/" + keycloakRealm + "/protocol/openid-connect/token"
 
 // restEndpoint is NICo REST's base URL at its published address.
 func restEndpoint(s *nicosettings.Settings) string {
@@ -349,7 +356,7 @@ func (e *Engine) installKeycloak(ctx context.Context, kubeconfig, root, tmp stri
 	if err != nil {
 		return nil, err
 	}
-	realm, err := keycloakRealmJSON(realmFile, login, cfg.Settings.EffectiveOrgID())
+	realm, err := keycloakRealmJSON(realmFile, login, cfg.Settings.EffectiveOrgID(), keycloakBaseURL(cfg.Settings))
 	if err != nil {
 		return nil, err
 	}
@@ -434,8 +441,9 @@ func (e *Engine) ensureKeycloakLogin(ctx context.Context) (*keycloakLogin, error
 }
 
 // keycloakRealmJSON returns the realm NICo's realm ConfigMap defines, with
-// login's client secrets and its roles in org instead of NICo's default org.
-func keycloakRealmJSON(configMap []byte, login *keycloakLogin, org string) ([]byte, error) {
+// login's client secrets, its roles in org instead of NICo's default org, and
+// frontendURL as the realm's frontend URL.
+func keycloakRealmJSON(configMap []byte, login *keycloakLogin, org, frontendURL string) ([]byte, error) {
 	var cm corev1.ConfigMap
 	if err := sigsyaml.Unmarshal(configMap, &cm); err != nil {
 		return nil, fmt.Errorf("reading NICo's Keycloak realm: %w", err)
@@ -463,6 +471,14 @@ func keycloakRealmJSON(configMap []byte, login *keycloakLogin, org string) ([]by
 	if len(secrets) > 0 {
 		return nil, fmt.Errorf("NICo's Keycloak realm does not define the clients %s and %s", serviceClientID, restClientID)
 	}
+	// REST accepts only tokens issued by the published address, so a token
+	// fetched in-cluster must carry that issuer too.
+	attributes, _ := realm["attributes"].(map[string]any)
+	if attributes == nil {
+		attributes = map[string]any{}
+	}
+	attributes["frontendUrl"] = frontendURL
+	realm["attributes"] = attributes
 	return json.Marshal(realm)
 }
 

@@ -259,18 +259,11 @@ func (e *Engine) waitForCertManager(ctx context.Context, kubeconfigPath string, 
 // the digest instead. It fails when the manifest lists none rather than fall
 // back to the tag.
 func pinnedCAPNICoImage() (string, error) {
-	img := manifest.Load().Components[manifest.ComponentCAPNICo].Images[manifest.ImageCAPNICo]
-	if !strings.HasPrefix(img.Digest, "sha256:") {
-		return "", fmt.Errorf("controllerdeploy: bootstrap-manifest.yaml lists no sha256 digest for the CAPNICo image %q", img.Ref)
+	image, err := manifest.Load().Components[manifest.ComponentCAPNICo].Images[manifest.ImageCAPNICo].Pinned()
+	if err != nil {
+		return "", fmt.Errorf("controllerdeploy: the CAPNICo image: %w", err)
 	}
-	repo := img.Ref
-	if at := strings.IndexByte(repo, '@'); at >= 0 {
-		repo = repo[:at]
-	}
-	if colon := strings.LastIndexByte(repo, ':'); colon > strings.LastIndexByte(repo, '/') {
-		repo = repo[:colon]
-	}
-	return repo + "@" + img.Digest, nil
+	return image, nil
 }
 
 // capnicoImageLine matches an image: line of the manifest.
@@ -346,6 +339,22 @@ func capnicoSecretsManifest(a CAPNICoAccess) ([]byte, error) {
 		return nil, fmt.Errorf("controllerdeploy: encoding the CAPNICo secrets: %w", err)
 	}
 	return out, nil
+}
+
+// SetCAPNICoEndpoints points the nico-credentials Secret CAPNICo calls NICo
+// with at endpoint and tokenURL, keeping its client. CAPNICo reads the Secret
+// again on its next call to NICo.
+func (e *Engine) SetCAPNICoEndpoints(ctx context.Context, kubeconfigPath, endpoint, tokenURL string) error {
+	patch, err := json.Marshal(map[string]any{"stringData": map[string]string{"endpoint": endpoint, "tokenURL": tokenURL}})
+	if err != nil {
+		return fmt.Errorf("controllerdeploy: encoding the CAPNICo endpoints: %w", err)
+	}
+	if out, err := e.Runner.Run(ctx, "kubectl", "--kubeconfig", kubeconfigPath, "-n", capnicoNamespace,
+		"patch", "secret", nicoCredentialsSecret, "--type", "merge", "-p", string(patch)); err != nil {
+		return fmt.Errorf("controllerdeploy: pointing CAPNICo at %s: %w\n%s", endpoint, err, out)
+	}
+	e.log.Info("CAPNICo calls NICo at its new endpoints", "endpoint", endpoint, "tokenURL", tokenURL)
+	return nil
 }
 
 // installCAPICore runs `clusterctl init` for CAPI core and the kubeadm

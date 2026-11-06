@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -97,6 +99,38 @@ func SeedPortMappings(a nicosettings.Addresses) []engine.PortMapping {
 		})
 	}
 	return mappings
+}
+
+// SeedLoopback returns, for each of REST and Keycloak whose address is vip, a
+// Kind port mapping of its node port on the bootstrap host's 127.0.0.1, and a
+// dialer that connects to its published address and port through that
+// mapping, so nvkectl reaches it through the bootstrap cluster once the site's
+// kube-vip holds vip. Requests keep the published address as their host, so
+// Keycloak's tokens keep the issuer REST accepts. It returns no mappings and a
+// nil dialer when neither is on vip.
+func SeedLoopback(a nicosettings.Addresses, vip netip.Addr) ([]engine.PortMapping, func(ctx context.Context, network, addr string) (net.Conn, error)) {
+	var mappings []engine.PortMapping
+	via := map[string]string{}
+	for _, s := range []struct {
+		published netip.AddrPort
+		nodePort  int32
+	}{{a.RESTEndpoint(), restNodePort}, {a.KeycloakEndpoint(), keycloakNodePort}} {
+		if !vip.IsValid() || s.published.Addr() != vip {
+			continue
+		}
+		mappings = append(mappings, engine.PortMapping{ContainerPort: s.nodePort, HostPort: s.nodePort, ListenAddress: "127.0.0.1"})
+		via[s.published.String()] = net.JoinHostPort("127.0.0.1", fmt.Sprint(s.nodePort))
+	}
+	if len(mappings) == 0 {
+		return nil, nil
+	}
+	var d net.Dialer
+	return mappings, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if local, ok := via[addr]; ok {
+			addr = local
+		}
+		return d.DialContext(ctx, network, addr)
+	}
 }
 
 // publishSeed creates the NodePort Services the seed's port mappings reach,

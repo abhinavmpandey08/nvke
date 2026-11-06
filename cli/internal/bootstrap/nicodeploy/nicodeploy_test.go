@@ -457,7 +457,7 @@ func TestKeycloakRealmJSON(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b, err := keycloakRealmJSON([]byte(tt.configMap), login, tt.org)
+			b, err := keycloakRealmJSON([]byte(tt.configMap), login, tt.org, "http://10.0.0.5:30082")
 			if tt.wantErr {
 				require.Error(t, err)
 				return
@@ -469,6 +469,7 @@ func TestKeycloakRealmJSON(t *testing.T) {
 				Users   []struct {
 					RealmRoles []any `json:"realmRoles"`
 				} `json:"users"`
+				Attributes map[string]any `json:"attributes"`
 			}
 			require.NoError(t, json.Unmarshal(b, &realm))
 			secrets := map[string]string{}
@@ -477,6 +478,7 @@ func TestKeycloakRealmJSON(t *testing.T) {
 			}
 			assert.Equal(t, map[string]string{"nico-rest": "rest-secret", "ncx-service": "service-secret"}, secrets)
 			assert.Equal(t, tt.wantRoles, realm.Users[0].RealmRoles)
+			assert.Equal(t, "http://10.0.0.5:30082", realm.Attributes["frontendUrl"])
 		})
 	}
 }

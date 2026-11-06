@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -38,9 +39,15 @@ type ClientCredentials struct {
 }
 
 // New returns a Client for the org orgID of the REST API at endpoint, served
-// under apiName, that fetches its tokens with creds.
-func New(endpoint, orgID, apiName string, creds ClientCredentials) *Client {
+// under apiName, that fetches its tokens with creds. dial connects both; a
+// plain dialer when nil.
+func New(endpoint, orgID, apiName string, creds ClientCredentials, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *Client {
 	base := &http.Client{Timeout: 30 * time.Second}
+	if dial != nil {
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.DialContext = dial
+		base.Transport = t
+	}
 	cc := clientcredentials.Config{ClientID: creds.ClientID, ClientSecret: creds.ClientSecret, TokenURL: creds.TokenURL}
 	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, base)
 	return &Client{

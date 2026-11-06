@@ -3,13 +3,21 @@
 
 package nicosettings
 
-import "os"
+import (
+	"os"
+	"strings"
+	"unicode"
+)
+
+// maxBGPPasswordLength is the longest TCP MD5 key Linux takes.
+const maxBGPPasswordLength = 80
 
 // SecretsFromEnv reads the secrets s needs from the environment. Required: the
 // site-wide BMC root password, the host and DPU UEFI passwords, each machine's
 // <BMCLogin>_USERNAME and <BMCLogin>_PASSWORD. The DPU BMC factory login is
 // optional but set as a pair, and required when DPUFactoryModels is set; the
-// registry login and the BGP password are optional. The
+// registry login and the BGP password are optional; the BGP password is at most
+// 80 characters with no spaces. The
 // error names each missing variable, one per line, and never a value.
 func SecretsFromEnv(s *Settings) (Secrets, error) {
 	sec := Secrets{
@@ -49,6 +57,10 @@ func SecretsFromEnv(s *Settings) (Secrets, error) {
 			}
 		}
 		sec.BMCLogins[m.BMCLogin] = login
+	}
+	if len(sec.BGPPassword) > maxBGPPasswordLength || strings.ContainsFunc(sec.BGPPassword, unicode.IsSpace) {
+		p.addf("%s must be at most %d characters with no spaces: it is the TCP MD5 key of the seed's BGP sessions",
+			BGPPasswordEnv, maxBGPPasswordLength)
 	}
 	if err := p.err(); err != nil {
 		return Secrets{}, err

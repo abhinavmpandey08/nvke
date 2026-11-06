@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/netip"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,6 +20,28 @@ import (
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/engine"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
 )
+
+func TestSeedLoopback(t *testing.T) {
+	vip := netip.MustParseAddr("10.0.0.250")
+	rest := engine.PortMapping{ContainerPort: 31388, HostPort: 31388, ListenAddress: "127.0.0.1"}
+	keycloak := engine.PortMapping{ContainerPort: 31082, HostPort: 31082, ListenAddress: "127.0.0.1"}
+	for name, tt := range map[string]struct {
+		a    nicosettings.Addresses
+		vip  netip.Addr
+		want []engine.PortMapping
+	}{
+		"REST and Keycloak on the VIP": {nicosettings.Addresses{REST: "10.0.0.250:30388", Keycloak: "10.0.0.250:30082"}, vip, []engine.PortMapping{rest, keycloak}},
+		"only Keycloak on the VIP":     {nicosettings.Addresses{REST: "10.0.0.88", Keycloak: "10.0.0.250:30082"}, vip, []engine.PortMapping{keycloak}},
+		"neither on the VIP":           {nicosettings.Addresses{REST: "10.0.0.88", Keycloak: "10.0.0.82"}, vip, nil},
+		"no VIP":                       {nicosettings.Addresses{REST: "10.0.0.250", Keycloak: "10.0.0.82"}, netip.Addr{}, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, dial := SeedLoopback(tt.a, tt.vip)
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, tt.want == nil, dial == nil, "a dialer exactly when something is mapped")
+		})
+	}
+}
 
 func TestSeedPortMappings(t *testing.T) {
 	base := []engine.PortMapping{

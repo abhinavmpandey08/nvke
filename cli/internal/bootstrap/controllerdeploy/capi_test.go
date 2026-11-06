@@ -837,3 +837,15 @@ func TestCAPNICoArtifact_IsTheOneTheDeployPathBinds(t *testing.T) {
 		t.Errorf("release.yaml names image %q, which the embedded manifest does not run", rel.Image)
 	}
 }
+
+func TestSetCAPNICoEndpoints(t *testing.T) {
+	runner := &fakeRunner{}
+	if err := New(runner, nil).SetCAPNICoEndpoints(context.Background(), "/kc", "http://rest.example:8388", "http://kc.example:8082/token"); err != nil {
+		t.Fatalf("SetCAPNICoEndpoints: %v", err)
+	}
+	want := "--kubeconfig /kc -n capnico-system patch secret nico-credentials --type merge -p " +
+		`{"stringData":{"endpoint":"http://rest.example:8388","tokenURL":"http://kc.example:8082/token"}}`
+	if len(runner.calls) != 1 || joinArgs(runner.calls[0].args) != want {
+		t.Errorf("calls = %+v, want one kubectl %s", runner.calls, want)
+	}
+}

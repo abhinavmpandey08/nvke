@@ -673,6 +673,11 @@ func TestSecretsFromEnv(t *testing.T) {
 			name: "the BGP password",
 			env:  map[string]string{BGPPasswordEnv: "example-bgp-password"},
 		},
+		{
+			name:    "a BGP password with a space",
+			env:     map[string]string{BGPPasswordEnv: "example bgp password"},
+			wantErr: []string{BGPPasswordEnv + " must be at most 80 characters with no spaces"},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, err := Load(fixture(t), "")

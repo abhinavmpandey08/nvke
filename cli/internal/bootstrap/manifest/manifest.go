@@ -10,6 +10,8 @@ package manifest
 import (
 	"bytes"
 	_ "embed"
+	"fmt"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -33,6 +35,10 @@ const (
 	ComponentCertManager      = "cert-manager"
 	// ComponentMetalLB publishes NICo's services on the site cluster.
 	ComponentMetalLB = "metallb"
+	// ComponentFRR is the BGP speaker that announces NICo's service addresses
+	// from the bootstrap host, and ImageFRR its image's key.
+	ComponentFRR = "frr"
+	ImageFRR     = "speaker"
 
 	// Image keys under the two components this repository builds.
 	ImageController = "controller"
@@ -83,6 +89,22 @@ type Image struct {
 	Ref string `yaml:"ref"`
 	// Digest is the image digest. Empty for the images the operator builds.
 	Digest string `yaml:"digest,omitempty"`
+}
+
+// Pinned returns the image as repository@Digest, without its tag, which a
+// registry can move. It fails when Digest is not a sha256 digest.
+func (i Image) Pinned() (string, error) {
+	if !strings.HasPrefix(i.Digest, "sha256:") {
+		return "", fmt.Errorf("bootstrap-manifest.yaml lists no sha256 digest for the image %q", i.Ref)
+	}
+	repo := i.Ref
+	if at := strings.IndexByte(repo, '@'); at >= 0 {
+		repo = repo[:at]
+	}
+	if colon := strings.LastIndexByte(repo, ':'); colon > strings.LastIndexByte(repo, '/') {
+		repo = repo[:colon]
+	}
+	return repo + "@" + i.Digest, nil
 }
 
 // Load parses the embedded manifest. It panics if the document does not

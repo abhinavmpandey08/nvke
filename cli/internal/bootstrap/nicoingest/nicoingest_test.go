@@ -226,7 +226,7 @@ func restServer(t *testing.T, machines func() []map[string]any) *nicorest.Client
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return nicorest.New(srv.URL, "ncx", "nico", nicorest.ClientCredentials{TokenURL: srv.URL + "/token", ClientID: "c", ClientSecret: "s"})
+	return nicorest.New(srv.URL, "ncx", "nico", nicorest.ClientCredentials{TokenURL: srv.URL + "/token", ClientID: "c", ClientSecret: "s"}, nil)
 }
 
 func bmcMachine(mac, status string) map[string]any {

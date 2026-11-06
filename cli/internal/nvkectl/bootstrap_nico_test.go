@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,13 +18,18 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicoalloc"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicodeploy"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/nicosettings"
+	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/seedbgp"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitecluster"
 	"github.com/dsx-ai-factory/nvke/cli/internal/bootstrap/sitespec"
 	"github.com/dsx-ai-factory/nvke/cli/internal/redact"
+	api "github.com/dsx-ai-factory/nvke/controller/api"
 )
 
 // ipRunner answers `ip -o addr show` with addrs, refuses changes with refuse
@@ -236,4 +242,205 @@ func TestManagedNicoAddresses(t *testing.T) {
 		NTP: []string{"192.0.2.16", "192.0.2.17"},
 	}}}}
 	assert.ElementsMatch(t, []string{"192.0.2.10", "192.0.2.11", "192.0.2.12", "192.0.2.13", "192.0.2.14", "192.0.2.16", "192.0.2.17"}, n.addresses())
+}
+
+// seedHost is the bootstrap host: `ip -o addr show` prints addrs, `ip route
+// get` names src 10.0.0.5, a speaker's container runs, with another
+// configuration than a test writes, and an Established session, and every
+// change is recorded.
+type seedHost struct {
+	addrs string
+	calls []string
+}
+
+func (h *seedHost) Run(_ context.Context, _ map[string]string, name string, args ...string) (string, error) {
+	cmd := strings.Join(append([]string{name}, args...), " ")
+	switch {
+	case cmd == "ip -o addr show":
+		return h.addrs, nil
+	case strings.HasPrefix(cmd, "ip -o route get"):
+		return args[3] + " dev eth0 src 10.0.0.5 uid 0", nil
+	case strings.HasPrefix(cmd, "nerdctl inspect"):
+		return "true", nil
+	case strings.HasSuffix(cmd, "show bgp neighbors json"):
+		return `{"10.0.0.1":{"bgpState":"Established"}}`, nil
+	}
+	h.calls = append(h.calls, cmd)
+	return "", nil
+}
+
+// kubeRunner records the commands controllerdeploy runs.
+type kubeRunner struct{ calls []string }
+
+func (r *kubeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
+	r.calls = append(r.calls, strings.Join(append([]string{name}, args...), " "))
+	return "", nil
+}
+
+func vipNico(t *testing.T, rest, keycloak string, withdrawn ...string) *managedNico {
+	n := &managedNico{
+		settings: &nicosettings.Settings{File: nicosettings.File{
+			Addresses: nicosettings.Addresses{DHCP: "192.0.2.10", PXE: "192.0.2.11", API: "192.0.2.12", REST: rest, Keycloak: keycloak},
+			BGP:       nicosettings.BGP{Seed: nicosettings.BGPSpeaker{ASN: 65001, Peers: []nicosettings.BGPPeer{{Address: "10.0.0.1", ASN: 65000}}}},
+		}},
+		vip:      netip.MustParseAddr("192.0.2.250"),
+		bgpDir:   filepath.Join(t.TempDir(), "bgp"),
+		seedKube: fake.NewClientset(),
+	}
+	if len(withdrawn) > 0 {
+		_, err := n.seedKube.CoreV1().ConfigMaps(withdrawnNamespace).Create(context.Background(), &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: withdrawnNamespace, Name: withdrawnConfigMap},
+			Data:       map[string]string{withdrawnKey: strings.Join(withdrawn, "\n")},
+		}, metav1.CreateOptions{})
+		require.NoError(t, err)
+	}
+	return n
+}
+
+func recordedWithdrawn(t *testing.T, n *managedNico) []string {
+	cm, err := n.seedKube.CoreV1().ConfigMaps(withdrawnNamespace).Get(context.Background(), withdrawnConfigMap, metav1.GetOptions{})
+	require.NoError(t, err)
+	return strings.Fields(cm.Data[withdrawnKey])
+}
+
+// TestManagedNicoAnnounce: a new run announces every service address; a
+// resumed run announces only those an earlier run did not withdraw, takes the
+// withdrawn ones off the host and puts the others back.
+func TestManagedNicoAnnounce(t *testing.T) {
+	const onLo = "1: lo    inet 192.0.2.250/32 scope global lo\n"
+	for name, tt := range map[string]struct {
+		adopted   bool
+		withdrawn []string
+		wantConf  []string
+		notConf   []string
+		wantCalls []string
+	}{
+		"a new run": {
+			wantConf:  []string{"network 192.0.2.10/32", "network 192.0.2.250/32", "bgp router-id 10.0.0.5"},
+			wantCalls: []string{"nerdctl rm -f nvkectl-bootstrap-nico-bgp", "nerdctl run"},
+		},
+		"resumed after the VIP was withdrawn": {
+			adopted: true, withdrawn: []string{"192.0.2.250"},
+			wantConf: []string{"network 192.0.2.10/32"}, notConf: []string{"192.0.2.250"},
+			wantCalls: []string{"ip addr del 192.0.2.250/32 dev lo", "ip addr add 192.0.2.10/32 dev lo", "nerdctl rm -f nvkectl-bootstrap-nico-bgp", "nerdctl run"},
+		},
+		"resumed after every address was withdrawn": {
+			adopted: true, withdrawn: []string{"192.0.2.10", "192.0.2.11", "192.0.2.12", "192.0.2.250"},
+			wantCalls: []string{"ip addr del 192.0.2.250/32 dev lo"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			n := vipNico(t, "192.0.2.250:30388", "192.0.2.250:30082", tt.withdrawn...)
+			host := &seedHost{addrs: onLo}
+			require.NoError(t, n.announce(context.Background(), tt.adopted, "nvkectl-bootstrap", "", host, slog.New(slog.DiscardHandler)))
+			var got []string
+			for _, c := range host.calls {
+				if strings.HasPrefix(c, "nerdctl run") {
+					c = "nerdctl run"
+					assert.Contains(t, strings.Join(host.calls, " "), "--name nvkectl-bootstrap-nico-bgp")
+				}
+				if strings.HasPrefix(c, "ip addr add") && !strings.Contains(c, "192.0.2.10/") {
+					continue
+				}
+				got = append(got, c)
+			}
+			assert.Equal(t, tt.wantCalls, got)
+			conf, _ := os.ReadFile(filepath.Join(n.bgpDir, "frr.conf"))
+			for _, w := range tt.wantConf {
+				assert.Contains(t, string(conf), w)
+			}
+			for _, w := range tt.notConf {
+				assert.NotContains(t, string(conf), w)
+			}
+		})
+	}
+}
+
+// TestManagedNicoWithdrawVIP: once the site cluster request is accepted, a
+// REST or Keycloak on the control-plane VIP moves CAPNICo to NICo's in-cluster
+// endpoints, and the VIP leaves the bootstrap host: recorded first, then its
+// route, then the address. Without one on the VIP nothing changes.
+func TestManagedNicoWithdrawVIP(t *testing.T) {
+	const patch = "kubectl --kubeconfig /seed -n capnico-system patch secret nico-credentials --type merge -p " +
+		`{"stringData":{"endpoint":"` + nicodeploy.InClusterRESTEndpoint + `","tokenURL":"` + nicodeploy.InClusterTokenURL + `"}}`
+	withdraw := "nerdctl exec nvkectl-bootstrap-nico-bgp vtysh -c configure terminal -c router bgp 65001 " +
+		"-c address-family ipv4 unicast -c no network 192.0.2.250/32"
+	for name, tt := range map[string]struct {
+		rest, keycloak string
+		withdrawn      []string
+		wantKube       []string
+		wantHost       []string
+		wantRecorded   []string
+	}{
+		"REST and Keycloak on the VIP": {
+			rest: "192.0.2.250:30388", keycloak: "192.0.2.250:30082",
+			wantKube: []string{patch}, wantHost: []string{withdraw, "ip addr del 192.0.2.250/32 dev lo"},
+			wantRecorded: []string{"192.0.2.250"},
+		},
+		"only Keycloak on the VIP": {
+			rest: "192.0.2.13", keycloak: "192.0.2.250:30082",
+			wantKube: []string{patch}, wantHost: []string{withdraw, "ip addr del 192.0.2.250/32 dev lo"},
+			wantRecorded: []string{"192.0.2.250"},
+		},
+		"resumed after the VIP was withdrawn": {
+			rest: "192.0.2.250:30388", keycloak: "192.0.2.250:30082", withdrawn: []string{"192.0.2.250"},
+			wantKube: []string{patch}, wantRecorded: []string{"192.0.2.250"},
+		},
+		"neither on the VIP": {rest: "192.0.2.13", keycloak: "192.0.2.14"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			n := vipNico(t, tt.rest, tt.keycloak, tt.withdrawn...)
+			n.withdrawn = tt.withdrawn
+			n.speaker = &seedbgp.Speaker{Runner: &seedHost{}, Logger: slog.New(slog.DiscardHandler)}
+			n.bgp = seedbgp.Config{Name: "nvkectl-bootstrap-nico-bgp", Dir: n.bgpDir, Image: "frr@sha256:abc", BGP: n.settings.BGP.Seed}
+			host := &seedHost{addrs: "1: lo    inet 192.0.2.250/32 scope global lo\n"}
+			n.speaker.Runner = host
+			kube := &kubeRunner{}
+			require.NoError(t, n.withdrawVIP(context.Background(), "/seed", kube, host, slog.New(slog.DiscardHandler)))
+			assert.Equal(t, tt.wantKube, kube.calls)
+			assert.Equal(t, tt.wantHost, host.calls)
+			if tt.wantRecorded == nil {
+				return
+			}
+			assert.Equal(t, tt.wantRecorded, recordedWithdrawn(t, n))
+			if tt.withdrawn == nil {
+				conf, err := os.ReadFile(filepath.Join(n.bgpDir, "frr.conf"))
+				require.NoError(t, err)
+				assert.NotContains(t, string(conf), "192.0.2.250", "the speaker's configuration still announces the VIP")
+				assert.Contains(t, string(conf), "network 192.0.2.10/32")
+			}
+		})
+	}
+}
+
+// TestManagedNicoWithdrawAll: the move records every address withdrawn, stops
+// the speaker and takes the addresses off the host.
+func TestManagedNicoWithdrawAll(t *testing.T) {
+	n := vipNico(t, "192.0.2.13", "192.0.2.14")
+	host := &seedHost{addrs: "1: lo    inet 192.0.2.10/32 scope global lo\n"}
+	n.speaker = &seedbgp.Speaker{Runner: host, Logger: slog.New(slog.DiscardHandler)}
+	n.bgp = seedbgp.Config{Name: "nvkectl-bootstrap-nico-bgp", Dir: n.bgpDir}
+	require.NoError(t, n.withdrawAll(context.Background(), host, slog.New(slog.DiscardHandler)))
+	assert.Equal(t, []string{"nerdctl rm -f nvkectl-bootstrap-nico-bgp", "ip addr del 192.0.2.10/32 dev lo"}, host.calls)
+	assert.ElementsMatch(t, n.addresses(), recordedWithdrawn(t, n))
+}
+
+// acceptingAPI is a controller that accepts every create request.
+type acceptingAPI struct{ sitecluster.ClusterAPI }
+
+func (acceptingAPI) CreateCluster(context.Context, api.CreateClusterJSONRequestBody) (*api.Cluster, error) {
+	return &api.Cluster{ID: uuid.MustParse("00000000-0000-0000-0000-000000000001"), Name: "nvke-site"}, nil
+}
+
+// TestCreateSiteClusterCallsAccepted: the hook runs as soon as the create is
+// accepted, and its failure keeps the bootstrap cluster.
+func TestCreateSiteClusterCallsAccepted(t *testing.T) {
+	inv, err := sitespec.Load(nicoSiteSpecFile(t))
+	require.NoError(t, err)
+	called := false
+	_, kept, err := createSiteCluster(context.Background(), nil, inv, &bootstrapSiteOptions{}, acceptingAPI{},
+		func(context.Context) error { called = true; return errors.New("withdrawing the VIP") }, slog.New(slog.DiscardHandler))
+	require.ErrorContains(t, err, "withdrawing the VIP")
+	assert.True(t, called)
+	assert.True(t, kept, "a failure after the create is accepted keeps the bootstrap cluster")
 }
