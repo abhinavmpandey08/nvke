@@ -105,3 +105,13 @@ func TestFromKubeConditionKeyReportsMissingConditionUnderTheCurrentKey(t *testin
 	require.Contains(t, got.Message, keys.NeedsRecycle.String())
 	require.NotContains(t, got.Message, keys.NeedsRecycle.Legacy())
 }
+
+func TestApplyKubernetesNodeHealthRecordsKubeletVersion(t *testing.T) {
+	controllerNode := db.Node{KubeletVersion: "1.36.4"}
+
+	applyKubernetesNodeHealth(&controllerNode, &corev1.Node{Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "v1.36.6"}}})
+	require.Equal(t, "1.36.6", controllerNode.KubeletVersion)
+
+	applyKubernetesNodeHealth(&controllerNode, nil)
+	require.Empty(t, controllerNode.KubeletVersion, "a missing Node no longer reports a version")
+}

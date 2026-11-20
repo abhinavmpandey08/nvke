@@ -12,6 +12,7 @@ import (
 	"slices"
 
 	"github.com/google/uuid"
+	"k8s.io/utils/ptr"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/dsx-ai-factory/nvke/controller/api"
@@ -156,7 +157,15 @@ func (s *nodePoolService) CreateNodePool(
 		}
 
 		s.applyNodePoolDefaults(req.Body, cluster)
-		dbNodePool, err := dbNodePoolFromAPI(req.Body, cluster.KubernetesVersion)
+		// Mid-upgrade the target is newer than some apiservers, which a new
+		// kubelet must not be; take the version the control plane still runs.
+		poolVersion := cluster.KubernetesVersion
+		if cluster.Conditions.ControlPlaneUpgrading.Status == db.ConditionStatusTrue {
+			if poolVersion, err = runningControlPlaneVersion(ctx, tx, cluster); err != nil {
+				return err
+			}
+		}
+		dbNodePool, err := dbNodePoolFromAPI(req.Body, poolVersion)
 		if err != nil {
 			return fmt.Errorf("failed to convert node pool request: %w", err)
 		}
@@ -514,8 +523,8 @@ func (s *nodePoolService) UpdateNodePool(
 			return err
 		}
 		if req.Body != nil && req.Body.KubernetesVersion != nil {
-			if err := validateNodePoolKubernetesVersion(cluster, dbNodePool.KubernetesVersion, *req.Body.KubernetesVersion); err != nil {
-				return newBadRequestErrorf("%s", err)
+			if err := validateNodePoolKubernetesVersion(ctx, tx, cluster, dbNodePool.KubernetesVersion, *req.Body.KubernetesVersion); err != nil {
+				return err
 			}
 		}
 		if req.Body != nil && req.Body.DesiredNodeCount != nil && *req.Body.DesiredNodeCount > dbNodePool.DesiredCount {
@@ -689,27 +698,43 @@ func applyUpdateNodePoolRequest(cluster db.Cluster, dbNodePool *db.NodePool, req
 // kubeadm join on a worker does not check this, so the API is the only place it is caught.
 // While the control plane upgrades, its nodes run two versions, so the pool waits. The API
 // raises ControlPlaneUpgrading in the same write that stores the target, so it covers that.
-// An older version is allowed, so a pool can be rolled back.
-func validateNodePoolKubernetesVersion(cluster db.Cluster, currentVersion, requestedVersion string) error {
+// An older version is allowed, so a pool can be rolled back. The control
+// plane's version is the oldest kubelet its nodes report (the desired version
+// until they report one), so a target that has not reached every node does not count.
+func validateNodePoolKubernetesVersion(ctx context.Context, tx db.Tx, cluster db.Cluster, currentVersion, requestedVersion string) error {
 	if requestedVersion == currentVersion {
 		return nil
 	}
 	if cluster.Conditions.ControlPlaneUpgrading.Status == db.ConditionStatusTrue {
-		return fmt.Errorf("%w: wait for the control plane upgrade to %s to finish", errUpgradeInProgress, cluster.KubernetesVersion)
+		return newBadRequestErrorf("%s", fmt.Errorf("%w: wait for the control plane upgrade to %s to finish", errUpgradeInProgress, cluster.KubernetesVersion))
 	}
-	cpMajor, cpMinor, _, err := parseKubernetesVersion(cluster.KubernetesVersion)
+	controlPlaneVersion, err := runningControlPlaneVersion(ctx, tx, cluster)
 	if err != nil {
-		return fmt.Errorf("%w: control plane version: %w", errVersionSkewViolation, err)
+		return err
+	}
+	cpMajor, cpMinor, _, err := parseKubernetesVersion(controlPlaneVersion)
+	if err != nil {
+		return newBadRequestErrorf("%s", fmt.Errorf("%w: control plane version: %w", errVersionSkewViolation, err))
 	}
 	major, minor, _, err := parseKubernetesVersion(requestedVersion)
 	if err != nil {
-		return fmt.Errorf("%w: requested version: %w", errVersionSkewViolation, err)
+		return newBadRequestErrorf("%s", fmt.Errorf("%w: requested version: %w", errVersionSkewViolation, err))
 	}
 	if major > cpMajor || (major == cpMajor && minor > cpMinor) {
-		return fmt.Errorf("%w: node pool kubernetes version must not be newer than the control plane version (control plane: %s, requested: %s)",
-			errVersionSkewViolation, cluster.KubernetesVersion, requestedVersion)
+		return newBadRequestErrorf("%s: node pool kubernetes version must not be newer than the control plane version (control plane: %s, requested: %s)",
+			errVersionSkewViolation, controlPlaneVersion, requestedVersion)
 	}
 	return nil
+}
+
+// runningControlPlaneVersion is the oldest kubelet version the cluster's
+// control-plane nodes report, or its desired version until one reports.
+func runningControlPlaneVersion(ctx context.Context, tx db.Tx, cluster db.Cluster) (string, error) {
+	cpNodes, err := tx.ListNodes(ctx, db.NodeFilters{ClusterID: &cluster.ID, ControlPlane: ptr.To(true)})
+	if err != nil {
+		return "", fmt.Errorf("listing control plane nodes: %w", err)
+	}
+	return db.RunningKubernetesVersion(cpNodes, cluster.KubernetesVersion), nil
 }
 
 func validateUpdatedNodePool(cluster db.Cluster, dbNodePool *db.NodePool) error {

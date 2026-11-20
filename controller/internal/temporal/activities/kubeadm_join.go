@@ -5,7 +5,9 @@ package activities
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -90,12 +92,7 @@ func (a *Activities) kubeadmJoin(ctx context.Context, node db.Node) (KubeadmJoin
 	if err != nil {
 		return KubeadmJoinResult{}, fmt.Errorf("failed to get cluster: %w", err)
 	}
-	cpNode, err := a.findJoinedControlPlaneNode(ctx, node.ClusterID)
-	if err != nil {
-		return KubeadmJoinResult{}, err
-	}
-
-	joinStrings, err := a.getKubeadmJoinStrings(ctx, cpNode)
+	joinStrings, err := a.joinStringsFromControlPlane(ctx, node.ClusterID)
 	if err != nil {
 		return KubeadmJoinResult{}, err
 	}
@@ -107,7 +104,7 @@ func (a *Activities) kubeadmJoin(ctx context.Context, node db.Node) (KubeadmJoin
 		return KubeadmJoinResult{}, fmt.Errorf("agent returned empty kubeadm join string")
 	}
 
-	_, nodePool, err := nodes.GetNodeContext(ctx, a.db, node)
+	nodeSet, nodePool, err := nodes.GetNodeContext(ctx, a.db, node)
 	if err != nil {
 		return KubeadmJoinResult{}, fmt.Errorf("failed to get node pool for node: %w", err)
 	}
@@ -121,7 +118,7 @@ func (a *Activities) kubeadmJoin(ctx context.Context, node db.Node) (KubeadmJoin
 	if err != nil {
 		return KubeadmJoinResult{}, err
 	}
-	joinConfig.KubernetesVersion = cluster.KubernetesVersion
+	joinConfig.KubernetesVersion = joinKubernetesVersion(cluster, nodeSet)
 	joinConfig.SystemReservedMemory = nodePool.SystemReservedMemory
 	joinConfig.KubeReservedMemory = nodePool.KubeReservedMemory
 
@@ -185,6 +182,18 @@ func (a *Activities) kubeadmJoin(ctx context.Context, node db.Node) (KubeadmJoin
 	}, nil
 }
 
+// joinKubernetesVersion is the version a joining node's kubeadm and kubelet run, which
+// decides how its join config renders. A worker runs its node set's version, which can
+// differ from the cluster's: pools lag a control-plane upgrade, and a control plane
+// upgraded outside NVKE leaves the cluster's version behind. A control-plane node has
+// no node set.
+func joinKubernetesVersion(cluster db.Cluster, nodeSet db.NodeSet) string {
+	if nodeSet.KubernetesVersion != "" {
+		return nodeSet.KubernetesVersion
+	}
+	return cluster.KubernetesVersion
+}
+
 func (a *Activities) waitForKubeadmJoinReady(ctx context.Context, node db.Node) error {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -213,21 +222,57 @@ func (a *Activities) waitForKubeadmJoinReady(ctx context.Context, node db.Node) 
 	}
 }
 
-func (a *Activities) findJoinedControlPlaneNode(ctx context.Context, clusterID uuid.UUID) (db.Node, error) {
+// joinStringsFromControlPlane fetches join strings from a joined control-plane
+// node, trying the healthiest first and moving on when one fails: an agent
+// that does not answer (a node being replaced, or one whose SPIRE agent is not
+// registered yet) must not block every join while a healthy node sits unused.
+func (a *Activities) joinStringsFromControlPlane(ctx context.Context, clusterID uuid.UUID) (*nvkeproto.KubeadmJoinStringResponse, error) {
+	candidates, err := a.joinedControlPlaneNodes(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	var errs []error
+	for _, cpNode := range candidates {
+		joinStrings, err := a.getKubeadmJoinStrings(ctx, cpNode)
+		if err == nil {
+			return joinStrings, nil
+		}
+		errs = append(errs, fmt.Errorf("node %s: %w", cpNode.Name, err))
+	}
+	return nil, fmt.Errorf("no control-plane node returned join strings: %w", errors.Join(errs...))
+}
+
+// joinedControlPlaneNodes returns the cluster's joined control-plane nodes with
+// an IP that are not being deleted, those whose agent and Kubernetes Node are
+// ready first, each group in name order.
+func (a *Activities) joinedControlPlaneNodes(ctx context.Context, clusterID uuid.UUID) ([]db.Node, error) {
 	controlPlane := true
-	nodes, err := a.db.ListNodes(ctx, db.NodeFilters{
+	cpNodes, err := a.db.ListNodes(ctx, db.NodeFilters{
 		ClusterID:    &clusterID,
 		ControlPlane: &controlPlane,
 	})
 	if err != nil {
-		return db.Node{}, fmt.Errorf("failed to list control-plane nodes: %w", err)
+		return nil, fmt.Errorf("failed to list control-plane nodes: %w", err)
 	}
-	for _, node := range nodes {
-		if node.Conditions.Joined.Status == db.ConditionStatusTrue && node.IP != "" {
-			return node, nil
+	cpNodes = slices.DeleteFunc(cpNodes, func(n db.Node) bool {
+		return n.Conditions.Joined.Status != db.ConditionStatusTrue || n.IP == "" || nodes.IsDeleteInFlight(n)
+	})
+	if len(cpNodes) == 0 {
+		return nil, fmt.Errorf("no joined control-plane node found for cluster %s", clusterID)
+	}
+	healthy := func(n db.Node) bool {
+		return n.Conditions.NodeAgentReady.Status == db.ConditionStatusTrue && n.Conditions.KubernetesReady.Status == db.ConditionStatusTrue
+	}
+	slices.SortStableFunc(cpNodes, func(x, y db.Node) int {
+		if hx, hy := healthy(x), healthy(y); hx != hy {
+			if hx {
+				return -1
+			}
+			return 1
 		}
-	}
-	return db.Node{}, fmt.Errorf("no joined control-plane node found for cluster %s", clusterID)
+		return strings.Compare(x.Name, y.Name)
+	})
+	return cpNodes, nil
 }
 
 func (a *Activities) validateEtcdQuota(ctx context.Context, cluster db.Cluster) error {

@@ -115,9 +115,9 @@ func (r *Reconciler) updateKubernetesHealth(ctx context.Context, nodeID uuid.UUI
 			return nil
 		}
 
-		previousConditions := lockedNode.Conditions
+		previousConditions, previousKubeletVersion := lockedNode.Conditions, lockedNode.KubeletVersion
 		applyKubernetesNodeHealth(&lockedNode, kubeNode)
-		if lockedNode.Conditions.Equal(previousConditions) {
+		if lockedNode.Conditions.Equal(previousConditions) && lockedNode.KubeletVersion == previousKubeletVersion {
 			r.logger.Debug("Kubernetes node health unchanged, skipping update",
 				"nodeID", nodeID, "nodeName", lockedNode.Name)
 			return nil
@@ -127,6 +127,7 @@ func (r *Reconciler) updateKubernetesHealth(ctx context.Context, nodeID uuid.UUI
 			"nodeID", nodeID,
 			"nodeName", lockedNode.Name,
 			"changes", describeConditionChanges(previousConditions, lockedNode.Conditions),
+			"kubeletVersion", lockedNode.KubeletVersion,
 		)
 		r.logger.Debug("Kubernetes node health change detail",
 			"nodeID", nodeID,

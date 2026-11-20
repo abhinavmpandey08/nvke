@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/uptrace/bun"
+	"k8s.io/apimachinery/pkg/util/version"
 
 	"github.com/dsx-ai-factory/nvke/controller/internal/spiffe"
 )
@@ -54,6 +55,9 @@ type Node struct {
 	LaunchLayer        *LaunchLayerNodeProvider `bun:"launch_layer,type:jsonb"`
 	// CertificateInspection retains read-only public observations independently of lifecycle conditions.
 	CertificateInspection *CertificateInspection `bun:"type:jsonb,nullzero"`
+	// KubeletVersion is the kubelet version the node's Kubernetes Node reports,
+	// without a leading "v"; empty until observed.
+	KubeletVersion string `bun:"type:text,notnull,default:''"`
 }
 
 type NicoNodeProvider struct {
@@ -94,6 +98,24 @@ func (n Node) ValidateSecurityProfile() error {
 // IsManagedByNodePool reports whether the node is managed by a node pool controller.
 func (n Node) IsManagedByNodePool() bool {
 	return n.NodePoolID != uuid.Nil
+}
+
+// RunningKubernetesVersion returns the oldest kubelet version the nodes report,
+// or fallback when none has reported one. That is the version a control plane is
+// still guaranteed to serve, mid-upgrade or after it was upgraded outside NVKE.
+func RunningKubernetesVersion(nodes []Node, fallback string) string {
+	var oldest *version.Version
+	running := fallback
+	for _, n := range nodes {
+		v, err := version.ParseGeneric(n.KubeletVersion)
+		if err != nil {
+			continue
+		}
+		if oldest == nil || v.LessThan(oldest) {
+			oldest, running = v, n.KubeletVersion
+		}
+	}
+	return running
 }
 
 // IsManagedByControlPlaneController reports whether the node is a no-nodepool control plane node.

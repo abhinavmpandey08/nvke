@@ -67,7 +67,7 @@ func (s *clusterService) GetClusterControlPlane(
 		ReadyNodeCount:           readyNodeCount,
 		DeletingNodeCount:        deletingNodeCount,
 		DeleteRequestedNodeCount: deleteRequestedNodeCount,
-		KubernetesVersion:        dbCluster.KubernetesVersion,
+		KubernetesVersion:        db.RunningKubernetesVersion(cpNodes, dbCluster.KubernetesVersion),
 		ControlPlaneUpgrading:    apiConditionFromDB(dbCluster.Conditions.ControlPlaneUpgrading),
 		CpNodesRecycling:         apiConditionFromDB(dbCluster.Conditions.CPNodesRecycling),
 		Rollout:                  controlPlaneRolloutSummary(dbCluster, cpNodes, rolloutByNode),

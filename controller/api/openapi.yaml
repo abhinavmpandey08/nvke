@@ -125,7 +125,8 @@ tags:
       no leading `v`. Control-plane upgrades move forward one minor version at a
       time; downgrades and major-version changes are rejected. Worker node pools
       may trail the control plane by at most 3 minor versions. A new node pool
-      starts at the cluster's Kubernetes version. `controlPlaneKubernetesVersion`
+      starts at the cluster's Kubernetes version, or, while the control plane
+      upgrades, at the oldest kubelet version its nodes still run. `controlPlaneKubernetesVersion`
       and a pool's `kubernetesVersion` are desired versions; the control plane's
       current running version is reported in `ControlPlaneStatus.kubernetesVersion`.
 
@@ -1353,7 +1354,10 @@ components:
           x-order: 2
         kubernetesVersion:
           type: string
-          description: Current running control-plane Kubernetes version.
+          description: |
+            Current running control-plane Kubernetes version: the oldest kubelet
+            version the control-plane nodes report, or the desired version until
+            a node reports one. It lags the desired version during an upgrade.
           x-go-type-skip-optional-pointer: true
           x-order: 3
         controlPlaneUpgrading:
@@ -2005,9 +2009,9 @@ components:
           pattern: '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$'
           description: |
             Desired Kubernetes version for the pool's nodes, as X.Y.Z with no leading "v".
-            Must not be a newer minor or major version than the cluster's control plane,
-            and cannot change while the control plane upgrades. An older version is
-            accepted, to roll the pool back.
+            Must not be a newer minor or major version than the oldest kubelet the
+            control-plane nodes run, and cannot change while the control plane
+            upgrades. An older version is accepted, to roll the pool back.
         nico:
           $ref: "#/components/schemas/NicoNodePoolProviderUpdate"
         launchLayer:
@@ -2055,7 +2059,10 @@ components:
           description: Node names are `<cluster>-<prefix>-<NNNN>` (four-digit suffix), at most 63 characters in total.
         kubernetesVersion:
           type: string
-          description: Desired Kubernetes version for the pool's nodes. Inherits the cluster's version on create.
+          description: |
+            Desired Kubernetes version for the pool's nodes. Inherits the cluster's version on create;
+            a pool created while the control plane upgrades inherits the oldest kubelet version the
+            control-plane nodes still run.
           x-order: 12
         systemReservedMemory:
           type: string

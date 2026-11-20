@@ -5,6 +5,7 @@ package nodestatus
 
 import (
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -13,6 +14,14 @@ import (
 )
 
 func applyKubernetesNodeHealth(controllerNode *db.Node, kubeNode *corev1.Node) {
+	// A Node that is gone reports nothing, so its last version cannot hold back the
+	// control plane's running version (RunningKubernetesVersion).
+	switch {
+	case kubeNode == nil:
+		controllerNode.KubeletVersion = ""
+	case kubeNode.Status.NodeInfo.KubeletVersion != "":
+		controllerNode.KubeletVersion = strings.TrimPrefix(kubeNode.Status.NodeInfo.KubeletVersion, "v")
+	}
 	controllerNode.Conditions.KubernetesReady = fromKubeCondition(controllerNode.Conditions.KubernetesReady, kubeNode, string(corev1.NodeReady))
 	controllerNode.Conditions.KubernetesUnschedulable = kubernetesUnschedulableCondition(controllerNode.Conditions.KubernetesUnschedulable, kubeNode)
 

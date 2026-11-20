@@ -169,6 +169,62 @@ func TestUnit_ReconcileSkipsUpdateWhenHealthUnchanged(t *testing.T) {
 	tx.AssertExpectations(t)
 }
 
+// TestUnit_ReconcileRecordsKubeletVersionChange pins that a kubelet version
+// change alone is saved: the pool version gate reads it.
+func TestUnit_ReconcileRecordsKubeletVersionChange(t *testing.T) {
+	ctx := context.Background()
+	clusterID := uuid.New()
+	nodeID := uuid.New()
+	nodeName := "cp-1"
+	readySince := time.Date(2026, 8, 17, 21, 21, 14, 0, time.UTC)
+
+	existing := db.Node{
+		ID:             nodeID,
+		ClusterID:      clusterID,
+		Name:           nodeName,
+		KubeletVersion: "1.36.4",
+		Conditions: db.NodeConditions{
+			KubernetesReady:         db.Condition{Status: db.ConditionStatusTrue, Message: "kubelet is posting ready status", LastTransitionTime: readySince},
+			KubernetesUnschedulable: db.Condition{Status: db.ConditionStatusFalse, Message: "Node is schedulable", LastTransitionTime: readySince},
+		},
+	}
+	kubeNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+		Status: corev1.NodeStatus{
+			NodeInfo: corev1.NodeSystemInfo{KubeletVersion: "v1.37.1"},
+			Conditions: []corev1.NodeCondition{{
+				Type: corev1.NodeReady, Status: corev1.ConditionTrue, Message: "kubelet is posting ready status",
+				LastTransitionTime: metav1.Time{Time: readySince},
+			}},
+		},
+	}
+
+	database := &testutil.MockDB{}
+	database.On("ListNodes", mock.Anything, mock.Anything).Return([]db.Node{existing}, nil).Once()
+	database.On("RunInTx", mock.Anything, mock.Anything).Return(nil).Once()
+	tx := &testutil.MockTx{}
+	database.MockTx = tx
+	tx.On("GetNodeForUpdate", mock.Anything, nodeID).Return(existing, nil).Once()
+	tx.On("GetNode", mock.Anything, nodeID).Return(existing, nil).Maybe()
+	tx.On("UpdateNode", mock.Anything, mock.MatchedBy(func(n *db.Node) bool {
+		return n.ID == nodeID && n.KubeletVersion == "1.37.1"
+	})).Return(existing, nil).Once()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	reconciler := &Reconciler{
+		clusterID: clusterID,
+		db:        dbwrapper.New(database, slog.New(slog.DiscardHandler)),
+		client:    fake.NewClientBuilder().WithScheme(scheme).WithObjects(kubeNode).Build(),
+		logger:    slog.New(slog.DiscardHandler),
+	}
+
+	_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: nodeName}})
+
+	require.NoError(t, err)
+	tx.AssertExpectations(t)
+}
+
 func TestUnit_DescribeConditionChanges(t *testing.T) {
 	transition := time.Date(2026, 8, 17, 21, 21, 14, 0, time.UTC)
 	previous := db.NodeConditions{

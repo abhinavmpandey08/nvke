@@ -334,6 +334,34 @@ func TestNodePoolService_CreateNodePool(t *testing.T) {
 			},
 		},
 		{
+			name: "pool created during a control-plane upgrade takes the version the control plane still runs",
+			request: api.CreateNodePoolRequest{
+				ClusterID:        clusterID,
+				Name:             "test-pool",
+				NodeNamePrefix:   "test-pool-prefix",
+				Nico:             testNicoNodePoolProvider(),
+				DesiredNodeCount: 1,
+			},
+			setupMockCalls: func(tx *mockTx) {
+				tx.On("GetClusterForUpdate", mock.Anything, clusterID).Return(db.Cluster{
+					ID:                clusterID,
+					KubernetesVersion: "1.37.2",
+					PodCIDR:           "192.168.0.0/16",
+					ServiceCIDR:       "10.96.0.0/12",
+					Conditions:        db.ClusterConditions{ControlPlaneUpgrading: db.NewCondition(true, "upgrading control plane to 1.37.2")},
+					Nico:              &db.NicoClusterProvider{OrgID: orgID, SiteID: siteID},
+				}, nil)
+				tx.On("ListNodes", mock.Anything, mock.Anything).Return([]db.Node{
+					{ControlPlane: true, KubeletVersion: "1.37.2"},
+					{ControlPlane: true, KubeletVersion: "1.36.6"},
+				}, nil).Once()
+				tx.On("CreateNodePool", mock.Anything, mock.MatchedBy(func(n *db.NodePool) bool {
+					return n.KubernetesVersion == "1.36.6"
+				})).Return(db.NodePool{ID: nodePoolID, Name: "test-pool"}, nil)
+				tx.On("CreateWorkflowOutboxEntry", requestTrace, "ProvisionNodePool", mock.Anything, mock.Anything).Return(db.WorkflowOutbox{}, nil)
+			},
+		},
+		{
 			name: "pod CIDR lacks capacity for new node pool",
 			request: api.CreateNodePoolRequest{
 				ClusterID:        clusterID,
@@ -1219,8 +1247,18 @@ func TestNodePoolService_UpdateNodePool_KubernetesVersion(t *testing.T) {
 		controlPlaneUpgrading bool
 		poolVersion           string
 		requestedVersion      string
-		wantErrContains       string // empty means the update is accepted
+		// cpKubeletVersions are the kubelet versions the control-plane nodes report.
+		cpKubeletVersions []string
+		wantErrContains   string // empty means the update is accepted
 	}{
+		{
+			name:                "newer minor than the control plane's running kubelets is rejected",
+			controlPlaneVersion: "1.37.2",
+			cpKubeletVersions:   []string{"1.37.2", "1.36.6"},
+			poolVersion:         "1.36.6",
+			requestedVersion:    "1.37.2",
+			wantErrContains:     "control plane: 1.36.6, requested: 1.37.2",
+		},
 		{
 			name:                "newer minor than the control plane is rejected",
 			controlPlaneVersion: "1.36.3",
@@ -1305,6 +1343,11 @@ func TestNodePoolService_UpdateNodePool_KubernetesVersion(t *testing.T) {
 					SiteID: siteID,
 				},
 			}, nil)
+			var cpNodes []db.Node
+			for _, v := range tt.cpKubeletVersions {
+				cpNodes = append(cpNodes, db.Node{ControlPlane: true, KubeletVersion: v})
+			}
+			mockDB.MockTx.On("ListNodes", mock.Anything, mock.Anything).Return(cpNodes, nil).Maybe()
 			mockDB.MockTx.On("GetNodePoolForUpdate", mock.Anything, nodePoolID).Return(db.NodePool{
 				ID:                nodePoolID,
 				ClusterID:         clusterID,

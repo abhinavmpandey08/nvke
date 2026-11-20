@@ -512,7 +512,9 @@ type ControlPlaneStatus struct {
 	// ReadyNodeCount Control-plane nodes reporting Kubernetes Ready.
 	ReadyNodeCount int `json:"readyNodeCount"`
 
-	// KubernetesVersion Current running control-plane Kubernetes version.
+	// KubernetesVersion Current running control-plane Kubernetes version: the oldest kubelet
+	// version the control-plane nodes report, or the desired version until
+	// a node reports one. It lags the desired version during an upgrade.
 	KubernetesVersion string `json:"kubernetesVersion"`
 
 	// DeletingNodeCount Control-plane nodes being torn down. Deletes are serialized, so this is at most 1.
@@ -1399,7 +1401,9 @@ type NodePool struct {
 	// Name Node pool name. Unique within the cluster. Immutable.
 	Name string `json:"name"`
 
-	// KubernetesVersion Desired Kubernetes version for the pool's nodes. Inherits the cluster's version on create.
+	// KubernetesVersion Desired Kubernetes version for the pool's nodes. Inherits the cluster's version on create;
+	// a pool created while the control plane upgrades inherits the oldest kubelet version the
+	// control-plane nodes still run.
 	KubernetesVersion string `json:"kubernetesVersion"`
 
 	// SystemReservedMemory Memory reserved for system daemons. Nodes reserve 16Gi when omitted.
@@ -1777,9 +1781,9 @@ type UpdateNodePoolRequest struct {
 	KubeReservedMemory *string `json:"kubeReservedMemory,omitempty"`
 
 	// KubernetesVersion Desired Kubernetes version for the pool's nodes, as X.Y.Z with no leading "v".
-	// Must not be a newer minor or major version than the cluster's control plane,
-	// and cannot change while the control plane upgrades. An older version is
-	// accepted, to roll the pool back.
+	// Must not be a newer minor or major version than the oldest kubelet the
+	// control-plane nodes run, and cannot change while the control plane
+	// upgrades. An older version is accepted, to roll the pool back.
 	KubernetesVersion *string `json:"kubernetesVersion,omitempty"`
 
 	// LaunchLayer All LaunchLayer node-pool fields (instanceType, hostOSProfile, vmProfile,
