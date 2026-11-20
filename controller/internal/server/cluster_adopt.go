@@ -65,7 +65,7 @@ type adoption struct {
 
 // AdoptCluster records the cluster the controller runs on, so NVKE can add worker
 // node pools to it. Its operator keeps managing the control plane: NVKE never
-// upgrades, replaces or deletes an adopted control-plane node. It
+// upgrades, reconfigures, replaces or deletes an adopted control-plane node. It
 // shares createCluster with CreateCluster; the differences are the credentials
 // Secret, the checks against the running cluster, the adopted node rows, and the
 // control-plane build ProvisionCluster skips.

@@ -97,7 +97,7 @@ func (n Node) IsManagedByNodePool() bool {
 }
 
 // IsAdoptedSeed reports whether the node ran before NVKE adopted its cluster. Its
-// operator keeps managing it: NVKE never replaces or upgrades it.
+// operator keeps managing it: NVKE never replaces, upgrades or reconfigures it.
 func (n Node) IsAdoptedSeed() bool {
 	return n.Conditions.AdoptedSeed.Status == ConditionStatusTrue
 }

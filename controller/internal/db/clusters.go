@@ -548,7 +548,7 @@ type ClusterConditions struct {
 	// entry expires, so the replacement does not land in the same domain.
 	UnplaceableFailureDomains map[string]time.Time `json:"unplaceableFailureDomains,omitempty"`
 	// Adopted is True for a cluster recorded by POST /clusters/adopt. Its operator
-	// manages its control plane outside NVKE, which never upgrades or replaces it.
+	// manages its control plane outside NVKE, so nothing NVKE starts may change it.
 	Adopted Condition `json:"adopted,omitempty"`
 }
 

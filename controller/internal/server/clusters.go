@@ -1086,14 +1086,29 @@ func rejectAdoptedControlPlaneReplacement(cluster db.Cluster, previousDesiredCou
 		strings.Join(changes, ", "))
 }
 
-// rejectAdoptedControlPlaneMaintenance refuses a Kubernetes version change on an
-// adopted control plane, whose operator upgrades it outside NVKE. Even the
-// current version would run the add-on upgrade against it.
+// rejectAdoptedControlPlaneMaintenance refuses a PATCH that would start work on
+// an adopted control plane, whose operator manages it outside NVKE: a Kubernetes
+// version change (even to the current version, which still runs the add-on
+// upgrade), enabling etcd encryption, or enabling OIDC on the API servers.
 func rejectAdoptedControlPlaneMaintenance(cluster db.Cluster, req *api.UpdateClusterRequest) error {
-	if !cluster.IsAdopted() || req.ControlPlaneKubernetesVersion == nil || *req.ControlPlaneKubernetesVersion == "" {
+	if !cluster.IsAdopted() {
 		return nil
 	}
-	return newBadRequestErrorf("cannot change controlPlaneKubernetesVersion on an adopted control plane: its operator manages it outside NVKE")
+	var changes []string
+	if req.ControlPlaneKubernetesVersion != nil && *req.ControlPlaneKubernetesVersion != "" {
+		changes = append(changes, "controlPlaneKubernetesVersion")
+	}
+	if req.EnableEtcdEncryption != nil && *req.EnableEtcdEncryption && !cluster.EtcdEncrypted {
+		changes = append(changes, "enableEtcdEncryption")
+	}
+	if req.EnableOidc != nil && *req.EnableOidc && !cluster.OIDCAuthEnabled {
+		changes = append(changes, "enableOidc")
+	}
+	if len(changes) == 0 {
+		return nil
+	}
+	return newBadRequestErrorf("cannot change %s on an adopted control plane: its operator manages it outside NVKE",
+		strings.Join(changes, ", "))
 }
 
 // hasClusterLevelControlPlaneUpdate reports whether the update touches any of the

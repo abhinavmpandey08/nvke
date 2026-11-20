@@ -2396,13 +2396,15 @@ func TestApiClusterFromDB_OmitsMissingProviderPayload(t *testing.T) {
 }
 
 func TestClusterService_UpdateCluster_RefusesControlPlaneWorkOnAdoptedCluster(t *testing.T) {
-	version := "1.37.0"
+	enable, version := true, "1.37.0"
 	tests := []struct {
 		name string
 		body api.UpdateClusterRequest
 		want string
 	}{
 		{name: "Kubernetes upgrade", body: api.UpdateClusterRequest{ControlPlaneKubernetesVersion: &version}, want: "controlPlaneKubernetesVersion"},
+		{name: "etcd encryption", body: api.UpdateClusterRequest{EnableEtcdEncryption: &enable}, want: "enableEtcdEncryption"},
+		{name: "OIDC", body: api.UpdateClusterRequest{EnableOidc: &enable}, want: "enableOidc"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

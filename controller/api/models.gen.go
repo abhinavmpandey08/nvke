@@ -1344,7 +1344,7 @@ type NodeAgentUpgradeStatusPhase string
 // provisioning, readyToJoin, joined and provisioned; deletion moves through
 // deleteRequested (control-plane nodes) and deleting.
 type NodeConditions struct {
-	// AdoptedSeed Control-plane nodes of an adopted cluster only. True for a node that ran before NVKE adopted the cluster. Its operator manages it outside NVKE, which never upgrades, replaces or deletes it.
+	// AdoptedSeed Control-plane nodes of an adopted cluster only. True for a node that ran before NVKE adopted the cluster. Its operator manages it outside NVKE, which never upgrades, reconfigures, replaces or deletes it.
 	AdoptedSeed *Condition `json:"adoptedSeed,omitempty"`
 
 	// ControlPlanePreferredReplacement Control-plane nodes only. True while the node is a control-plane rebalance surge — a more-preferred replacement brought up to shed a less-preferred member.

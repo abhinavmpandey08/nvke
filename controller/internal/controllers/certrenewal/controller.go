@@ -75,6 +75,10 @@ func (c *Controller) Reconcile(ctx context.Context, key dbreconcile.Key) (reconc
 	if cluster.Conditions.Deleting.Status == db.ConditionStatusTrue {
 		return reconcile.Result{}, nil
 	}
+	// The operator of an adopted control plane renews its certificates.
+	if cluster.IsAdopted() {
+		return reconcile.Result{}, nil
+	}
 
 	now := time.Now()
 	// The first look at a cluster schedules the check instead of running it: a new cluster's certificates

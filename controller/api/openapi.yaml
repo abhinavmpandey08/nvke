@@ -314,9 +314,10 @@ paths:
         identity; until then NVKE cannot join workers.
 
         The operator keeps managing the control plane outside NVKE: NVKE never
-        upgrades, replaces or deletes an adopted control-plane node.
-        `PATCH /clusters/{clusterID}` refuses `controlPlaneKubernetesVersion`,
-        any `controlPlaneConfig.desiredCount` change and any change to a field
+        upgrades, reconfigures, renews certificates on, replaces or deletes an
+        adopted control-plane node. `PATCH /clusters/{clusterID}` refuses
+        `controlPlaneKubernetesVersion`, enabling etcd encryption or OIDC, any
+        `controlPlaneConfig.desiredCount` change and any change to a field
         that replaces nodes, such as `controlPlaneConfig.nico.release` or
         `configProfile`. `DELETE /nodes/{nodeID}` refuses an adopted node, and
         the cluster cannot be deleted through `DELETE /clusters/{clusterID}`.
@@ -2995,7 +2996,7 @@ components:
             - $ref: "#/components/schemas/Condition"
         adoptedSeed:
           x-fern-ignore: true
-          description: Control-plane nodes of an adopted cluster only. True for a node that ran before NVKE adopted the cluster. Its operator manages it outside NVKE, which never upgrades, replaces or deletes it.
+          description: Control-plane nodes of an adopted cluster only. True for a node that ran before NVKE adopted the cluster. Its operator manages it outside NVKE, which never upgrades, reconfigures, replaces or deletes it.
           allOf:
             - $ref: "#/components/schemas/Condition"
 

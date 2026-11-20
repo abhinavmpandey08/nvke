@@ -6,6 +6,7 @@ package activities
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/google/uuid"
 
@@ -33,6 +34,9 @@ func stableControlPlane(ctx context.Context, tx db.Tx, clusterID uuid.UUID, prec
 	}
 	if len(nodes) == 0 {
 		return nil, precondition("no control-plane nodes are available")
+	}
+	if slices.ContainsFunc(nodes, db.Node.IsAdoptedSeed) {
+		return nil, precondition("the control plane is adopted and managed by its operator")
 	}
 	for _, node := range nodes {
 		if node.IP == "" || node.Conditions.Joined.Status != db.ConditionStatusTrue ||

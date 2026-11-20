@@ -187,6 +187,27 @@ func TestBeginEtcdEncryptionKeyRotationRequiresControlPlaneNodesAtClusterVersion
 	}
 }
 
+// TestBeginEtcdEncryptionKeyRotationRefusesAdoptedControlPlane pins the
+// stableControlPlane refusal that also keeps certificate renewal off an adopted
+// control plane, whose operator manages it outside NVKE.
+func TestBeginEtcdEncryptionKeyRotationRefusesAdoptedControlPlane(t *testing.T) {
+	cluster := runningRotation()
+	cluster.Conditions.EtcdKeyRotation = nil
+	cluster.Conditions.UpdateInProgress = nil
+	a, tx := rotationActivities(t, &cluster)
+	node := stableRotationNode(cluster.ID)
+	node.Conditions.AdoptedSeed = db.NewCondition(true, "Adopted")
+	tx.nodes = append(tx.nodes, node)
+
+	_, err := a.BeginEtcdEncryptionKeyRotation(t.Context(), activities.BeginEtcdEncryptionKeyRotationInput{ClusterID: cluster.ID, WorkflowID: "owner"})
+
+	require.ErrorContains(t, err, "the control plane is adopted and managed by its operator")
+	var applicationErr *temporal.ApplicationError
+	require.ErrorAs(t, err, &applicationErr)
+	require.True(t, applicationErr.NonRetryable())
+	require.Zero(t, tx.writes)
+}
+
 func TestFailEtcdKeyRotationReleasesOnlyPrepareLock(t *testing.T) {
 	for _, phase := range []db.EtcdKeyRotationPhase{
 		db.EtcdKeyRotationPhasePrepare,

@@ -116,6 +116,23 @@ func TestUnit_ControllerReconcile(t *testing.T) {
 		temporalClient.AssertExpectations(t)
 	})
 
+	t.Run("skips an adopted cluster", func(t *testing.T) {
+		ctx := context.Background()
+		clusterID := uuid.New()
+		mockDB := &testutil.MockDB{}
+		cluster := provisionedCertificateRenewalCluster(clusterID)
+		cluster.Conditions.Adopted = db.NewCondition(true, "Adopted")
+		mockDB.On("GetCluster", mock.Anything, clusterID).Return(cluster, nil).Once()
+		temporalClient := &mockWorkflowStarter{}
+
+		result, err := newController(mockDB, temporalClient).Reconcile(ctx, dbreconcile.ClusterKey(clusterID))
+
+		require.NoError(t, err)
+		require.Equal(t, reconcile.Result{}, result)
+		mockDB.AssertExpectations(t)
+		temporalClient.AssertNotCalled(t, "ExecuteWorkflow", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	})
+
 	t.Run("skips cluster not yet due", func(t *testing.T) {
 		ctx := context.Background()
 		clusterID := uuid.New()
